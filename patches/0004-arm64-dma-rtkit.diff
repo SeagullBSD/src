@@ -1,0 +1,2533 @@
+Index: sys/arch/arm64/arm64/bus_dma.c
+===================================================================
+RCS file: /cvs/src/sys/arch/arm64/arm64/bus_dma.c,v
+diff -u -p -r1.18 bus_dma.c
+--- sys/arch/arm64/arm64/bus_dma.c	7 Aug 2026 19:07:30 -0000	1.18
++++ sys/arch/arm64/arm64/bus_dma.c	20 Nov 2026 16:50:44 -0000
+@@ -146,7 +146,7 @@ _dmamap_create(bus_dma_tag_t t, bus_size
+ 	int npages, error;
+ 	const struct kmem_dyn_mode *kd;
+ 
+-	if (bus_dma_high_pages > 0) {
++	if (bus_dma_high_pages > 0 && !(flags & BUS_DMA_NOBOUNCE)) {
+ 		use_bounce_buffer = 1;
+ 		constraint = &dma_constraint;
+ 	}
+Index: sys/arch/arm64/dev/rtkit.c
+===================================================================
+RCS file: /cvs/src/sys/arch/arm64/dev/rtkit.c,v
+diff -u -p -r1.19 rtkit.c
+--- sys/arch/arm64/dev/rtkit.c	1 Aug 2025 09:51:52 -0000	1.19
++++ sys/arch/arm64/dev/rtkit.c	20 Nov 2026 16:50:44 -0000
+@@ -16,12 +16,18 @@
+  */
+ 
+ #include <sys/param.h>
++#include <sys/atomic.h>
+ #include <sys/systm.h>
+ #include <sys/device.h>
+ #include <sys/malloc.h>
++#include <sys/mutex.h>
+ #include <sys/task.h>
++#include <sys/time.h>
++#include <sys/timeout.h>
+ 
+ #include <machine/bus.h>
++#include <machine/cpu.h>
++#include <machine/intr.h>
+ #include <machine/fdt.h>
+ 
+ #include <uvm/uvm_extern.h>
+@@ -39,7 +45,7 @@
+ #define RTKIT_EP_DEBUG			3
+ #define RTKIT_EP_IOREPORT		4
+ #define RTKIT_EP_OSLOG			8
+-#define RTKIT_EP_UNKNOWN		10
++#define RTKIT_EP_TRACEKIT		10
+ 
+ #define RTKIT_MGMT_TYPE(x)		(((x) >> 52) & 0xff)
+ #define RTKIT_MGMT_TYPE_SHIFT		52
+@@ -85,6 +91,8 @@
+ #define RTKIT_OSLOG_TYPE(x)		(((x) >> 56) & 0xff)
+ #define RTKIT_OSLOG_TYPE_SHIFT		(56 - RTKIT_MGMT_TYPE_SHIFT)
+ #define RTKIT_OSLOG_BUFFER_REQUEST	1
++#define RTKIT_OSLOG_LOG			2
++#define RTKIT_OSLOG_LOG_RESERVED	(0xffffffULL << 32)
+ #define RTKIT_OSLOG_BUFFER_ADDR(x)	(((x) >> 0) & 0xfffffffff)
+ #define RTKIT_OSLOG_BUFFER_SIZE(x)	(((x) >> 36) & 0xfffff)
+ #define RTKIT_OSLOG_BUFFER_SIZE_SHIFT	36
+@@ -92,6 +100,13 @@
+ #define RTKIT_OSLOG_UNKNOWN2		4
+ #define RTKIT_OSLOG_UNKNOWN3		5
+ 
++#define RTKIT_REPLY_QUEUE_SIZE 128
++#define RTKIT_REQUEST_QUEUE_SIZE 128
++/* One extra slot is reserved for the unique crash notification. */
++#define RTKIT_REQUEST_QUEUE_CAPACITY (RTKIT_REQUEST_QUEUE_SIZE + 1)
++#define RTKIT_RX_BUDGET 64
++#define RTKIT_REPLY_TIMEOUT_NS SEC_TO_NSEC(1)
++
+ /* Versions we support. */
+ #define RTKIT_MINVER			11
+ #define RTKIT_MAXVER			12
+@@ -101,40 +116,136 @@ struct rtkit_dmamem {
+ 	bus_dma_segment_t	rdm_seg;
+ 	size_t			rdm_size;
+ 	caddr_t			rdm_kva;
++	void			*rdm_cookie;
++	int			rdm_external;
++};
++
++enum rtkit_crashlog_state {
++	RTKIT_CRASHLOG_IDLE,
++	RTKIT_CRASHLOG_PENDING,
++	RTKIT_CRASHLOG_READY,
++	RTKIT_CRASHLOG_CRASHED,
++	RTKIT_CRASHLOG_SHUTDOWN
++};
++
++struct rtkit_request {
++	struct aplmbox_msg msg;
++	int crash_event;
+ };
+ 
+ struct rtkit_state {
+ 	struct mbox_channel	*mc;
++	unsigned int		 rx_active;
++	struct mutex		 request_mtx;
++	struct taskq		*request_taskq;
++	struct task		 request_task;
++	struct timeout		 rx_timeout;
++	struct rtkit_request	 request_queue[RTKIT_REQUEST_QUEUE_CAPACITY];
++	u_int			 request_head, request_count;
++	int			 request_active, rx_stopped, request_stopped;
++	int			 mailbox_paused;
++	int			 needs_recovery;
++	int			 power_unknown;
++	unsigned int		 power_ack_seen;
++	int			 rx_timer_used, reply_timer_used;
++	struct mutex		 send_mtx;
++	struct timeout		 reply_timeout;
++	struct task		 reply_fault_task;
++	struct aplmbox_msg	 reply_queue[RTKIT_REPLY_QUEUE_SIZE];
++	u_int			 reply_head, reply_count;
++	uint64_t		 reply_deadline;
++	int			 reply_stopped, reply_error;
++	int			 protocol_error;
++	unsigned int		 reply_fault_reported;
++	struct mutex		 crashlog_mtx;
++	unsigned int		 crash_requests;
+ 	struct rtkit		*rk;
++	char			node_name[32];
++	uint32_t		node_phandle;
+ 	int			flags;
+ 	char			*crashlog;
+ 	bus_addr_t		crashlog_addr;
+ 	bus_size_t		crashlog_size;
+-	struct task		crashlog_task;
++	enum rtkit_crashlog_state crashlog_state;
++	int			crashlog_external_map;
+ 	char			*ioreport;
+ 	bus_addr_t		ioreport_addr;
++	bus_addr_t		ioreport_reply_addr;
+ 	bus_size_t		ioreport_size;
+-	struct task		ioreport_task;
+ 	char			*oslog;
+ 	bus_addr_t		oslog_addr;
++	bus_addr_t		oslog_reply_addr;
+ 	bus_size_t		oslog_size;
+-	struct task		oslog_task;
+ 	char			*syslog;
+ 	bus_addr_t		syslog_addr;
++	bus_addr_t		syslog_reply_addr;
+ 	bus_size_t		syslog_size;
+-	struct task		syslog_task;
+ 	uint8_t			syslog_n_entries;
+ 	uint8_t			syslog_msg_size;
+ 	char			*syslog_msg;
+ 	uint16_t		iop_pwrstate;
+ 	uint16_t		ap_pwrstate;
+ 	uint64_t		epmap;
++	unsigned int		epmap_complete;
+ 	void			(*callback[32])(void *, uint64_t);
+ 	void			*arg[32];
+ 	struct rtkit_dmamem	dmamem[32];
+ 	int			ndmamem;
+ };
+ 
++static int rtkit_retry_replies_locked(struct rtkit_state *);
++
++static void
++rtkit_reply_fault_task(void *arg)
++{
++	struct rtkit_state *state = arg;
++	struct rtkit *rk = state->rk;
++	int error;
++
++	mtx_enter(&state->send_mtx);
++	error = state->reply_error;
++	if (!error)
++		error = __atomic_load_n(&state->protocol_error, __ATOMIC_ACQUIRE);
++	mtx_leave(&state->send_mtx);
++	/* Stop a level-triggered RX storm while retaining unread FIFO data. */
++	if (error && state->mc != NULL &&
++	    !__atomic_load_n(&state->mailbox_paused, __ATOMIC_ACQUIRE) &&
++	    mbox_pause(state->mc, 0) == 0) {
++		mtx_enter(&state->request_mtx);
++		state->rx_stopped = 1;
++		__atomic_store_n(&state->mailbox_paused, 1, __ATOMIC_RELEASE);
++		mtx_leave(&state->request_mtx);
++	}
++	if (error && rk && rk->rk_fault)
++		rk->rk_fault(rk->rk_cookie, error);
++}
++
++static void
++rtkit_reply_fault(struct rtkit_state *state, int error)
++{
++	int expected = 0;
++
++	if (!error)
++		return;
++	(void)__atomic_compare_exchange_n(&state->protocol_error, &expected,
++	    error, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
++	if (__atomic_exchange_n(&state->reply_fault_reported, 1,
++	    __ATOMIC_ACQ_REL))
++		return;
++	wakeup(&state->epmap_complete);
++	wakeup(&state->iop_pwrstate);
++	wakeup(&state->ap_pwrstate);
++	printf("rtkit: %s: protocol failure (%d)\n",
++	    state->node_name, error);
++	task_add(systqmp, &state->reply_fault_task);
++}
++
++static void
++rtkit_protocol_fault(struct rtkit_state *state, int error)
++{
++	rtkit_reply_fault(state, error);
++}
++
+ int
+ rtkit_recv(struct mbox_channel *mc, struct aplmbox_msg *msg)
+ {
+@@ -146,6 +257,7 @@ rtkit_send(struct rtkit_state *state, ui
+     uint64_t type, uint64_t data)
+ {
+ 	struct aplmbox_msg msg;
++	int error, reply_error;
+ 
+ 	msg.data0 = (type << RTKIT_MGMT_TYPE_SHIFT) | data;
+ 	msg.data1 = endpoint;
+@@ -155,7 +267,210 @@ rtkit_send(struct rtkit_state *state, ui
+ 		    msg.data0, msg.data1);
+ 	}
+ 
+-	return mbox_send(state->mc, &msg, sizeof(msg));
++	mtx_enter(&state->send_mtx);
++	error = __atomic_load_n(&state->protocol_error, __ATOMIC_ACQUIRE);
++	if (state->reply_stopped)
++		error = ESHUTDOWN;
++	else if (endpoint == RTKIT_EP_CRASHLOG &&
++	    __atomic_load_n(&state->crash_requests, __ATOMIC_ACQUIRE) >= 2)
++		error = ECANCELED;
++	else if (error) {
++		/* Preserve the first permanent fault. */
++	} else {
++		error = rtkit_retry_replies_locked(state);
++		if (!error && state->reply_count != 0)
++			error = EBUSY;
++		if (!error)
++			error = mbox_send(state->mc, &msg, sizeof(msg));
++	}
++	reply_error = state->reply_error;
++	mtx_leave(&state->send_mtx);
++	if (reply_error)
++		rtkit_reply_fault(state, reply_error);
++	return error;
++}
++
++/* Caller holds send_mtx. A successful send removes exactly one reply. */
++static int
++rtkit_retry_replies_locked(struct rtkit_state *state)
++{
++	struct aplmbox_msg *msg;
++	int error;
++
++	while (state->reply_count != 0 && !state->reply_stopped &&
++	    !state->reply_error) {
++		msg = &state->reply_queue[state->reply_head];
++		if (msg->data1 == RTKIT_EP_CRASHLOG &&
++		    __atomic_load_n(&state->crash_requests, __ATOMIC_ACQUIRE) >= 2) {
++			state->reply_head = (state->reply_head + 1) %
++			    RTKIT_REPLY_QUEUE_SIZE;
++			state->reply_count--;
++			state->reply_deadline = nsecuptime() + RTKIT_REPLY_TIMEOUT_NS;
++			continue;
++		}
++		error = mbox_send(state->mc, msg, sizeof(*msg));
++		if (error == EBUSY) {
++			if (nsecuptime() >= state->reply_deadline)
++				state->reply_error = ETIMEDOUT;
++			break;
++		}
++		if (error) {
++			state->reply_error = error;
++			break;
++		}
++		state->reply_head = (state->reply_head + 1) %
++		    RTKIT_REPLY_QUEUE_SIZE;
++		state->reply_count--;
++		state->reply_deadline = nsecuptime() + RTKIT_REPLY_TIMEOUT_NS;
++	}
++	return state->reply_error;
++}
++
++static void
++rtkit_reply_retry(void *arg)
++{
++	struct rtkit_state *state = arg;
++	int error;
++
++	mtx_enter(&state->send_mtx);
++	error = rtkit_retry_replies_locked(state);
++	if (state->reply_count && !state->reply_stopped && !error) {
++		state->reply_timer_used = 1;
++		timeout_add_msec(&state->reply_timeout, 1);
++	}
++	mtx_leave(&state->send_mtx);
++	if (error)
++		rtkit_reply_fault(state, error);
++}
++
++/* IRQ-safe: retain replies in order when the hardware FIFO is full. */
++static int
++rtkit_send_reply(struct rtkit_state *state, uint32_t endpoint,
++    uint64_t type, uint64_t data)
++{
++	struct aplmbox_msg msg;
++	u_int index;
++	int error = 0;
++
++	msg.data0 = (type << RTKIT_MGMT_TYPE_SHIFT) | data;
++	msg.data1 = endpoint;
++	mtx_enter(&state->send_mtx);
++	if (state->reply_stopped)
++		error = ESHUTDOWN;
++	else if (endpoint == RTKIT_EP_CRASHLOG &&
++	    __atomic_load_n(&state->crash_requests, __ATOMIC_ACQUIRE) >= 2) {
++		error = ECANCELED;
++		goto out;
++	} else if ((error = __atomic_load_n(&state->protocol_error,
++	    __ATOMIC_ACQUIRE)) != 0) {
++		/* Preserve the first permanent fault. */
++	} else if (state->reply_error)
++		error = state->reply_error;
++	else if (state->reply_count == 0) {
++		error = mbox_send(state->mc, &msg, sizeof(msg));
++		if (error == EBUSY) {
++			state->reply_deadline = nsecuptime() +
++			    RTKIT_REPLY_TIMEOUT_NS;
++			error = 0;
++		} else {
++			if (error)
++				state->reply_error = error;
++			goto out;
++		}
++	}
++	if (!error) {
++		if (state->reply_count == RTKIT_REPLY_QUEUE_SIZE) {
++			error = state->reply_error = ENOBUFS;
++		} else {
++			index = (state->reply_head + state->reply_count) %
++			    RTKIT_REPLY_QUEUE_SIZE;
++			state->reply_queue[index] = msg;
++			if (state->reply_count++ == 0) {
++				state->reply_timer_used = 1;
++				timeout_add_msec(&state->reply_timeout, 1);
++			}
++		}
++	}
++out:
++	mtx_leave(&state->send_mtx);
++	if (error && error != ESHUTDOWN && error != ECANCELED)
++		rtkit_reply_fault(state, error);
++	return error;
++}
++
++/*
++ * Process-context startup sends can encounter a full transmit FIFO during a
++ * burst.  Apple mailbox EBUSY means neither message word was written.  Do not
++ * hold send_mtx across the wait: receive callbacks also need to send replies.
++ * Other senders may run between attempts, but this message is sent at most once.
++ */
++static int
++rtkit_send_wait(struct rtkit_state *state, uint32_t endpoint, uint64_t type,
++    uint64_t data)
++{
++	uint64_t deadline, now, remaining;
++	int error, tries = 0;
++
++	deadline = cold ? 0 : nsecuptime() + 500000000ULL;
++	for (;;) {
++		error = rtkit_send(state, endpoint, type, data);
++		if (error != EBUSY)
++			return error;
++		if (cold) {
++			if (++tries >= 500)
++				return EBUSY;
++			/* Firmware may need an RX acknowledgement to drain TX. */
++			error = rtkit_poll(state);
++			if (error && error != EWOULDBLOCK)
++				return error;
++			delay(1000);
++			continue;
++		}
++		now = nsecuptime();
++		if (now >= deadline)
++			return EBUSY;
++		remaining = deadline - now;
++		error = tsleep_nsec(&state->mc, PWAIT, "rtktx",
++		    min(remaining, 1000000ULL));
++		if (error && error != EWOULDBLOCK)
++			return error;
++	}
++}
++
++/* Cold boot has no runnable timeout thread; finish queued replies here. */
++static int
++rtkit_flush_replies_cold(struct rtkit_state *state)
++{
++	int error, pending, tries;
++
++	for (tries = 0; tries < 1000; tries++) {
++		mtx_enter(&state->send_mtx);
++		error = rtkit_retry_replies_locked(state);
++		pending = state->reply_count != 0;
++		mtx_leave(&state->send_mtx);
++		if (error) {
++			rtkit_reply_fault(state, error);
++			return error;
++		}
++		if (!pending)
++			return __atomic_load_n(&state->protocol_error,
++			    __ATOMIC_ACQUIRE);
++		error = rtkit_poll(state);
++		if (error && error != EWOULDBLOCK)
++			return error;
++		delay(1000);
++	}
++	mtx_enter(&state->send_mtx);
++	if (state->reply_count == 0 && !state->reply_error) {
++		mtx_leave(&state->send_mtx);
++		return __atomic_load_n(&state->protocol_error, __ATOMIC_ACQUIRE);
++	}
++	if (!state->reply_error)
++		state->reply_error = ETIMEDOUT;
++	error = state->reply_error;
++	mtx_leave(&state->send_mtx);
++	rtkit_reply_fault(state, error);
++	return error;
+ }
+ 
+ bus_addr_t
+@@ -165,30 +480,88 @@ rtkit_alloc(struct rtkit_state *state, b
+ 	bus_dma_segment_t seg;
+ 	bus_dmamap_t map;
+ 	caddr_t kva;
+-	int nsegs;
++	bus_addr_t addr;
++	void *cookie;
++	int error, nsegs, dmaflags = cold ? BUS_DMA_NOWAIT : BUS_DMA_WAITOK;
+ 
+-	if (state->ndmamem >= nitems(state->dmamem))
++	if (size == 0 || state->ndmamem >= nitems(state->dmamem)) {
++		rtkit_protocol_fault(state, size == 0 ? EINVAL : ENOBUFS);
++		return (bus_addr_t)-1;
++	}
++	/* The custom allocator has no non-sleeping contract. */
++	if (cold && (rk->rk_alloc || (rk->rk_map && !rk->rk_map_nosleep))) {
++		rtkit_protocol_fault(state, EOPNOTSUPP);
+ 		return (bus_addr_t)-1;
++	}
+ 
+-	if (bus_dmamem_alloc(rk->rk_dmat, size, 16384, 0,
+-	    &seg, 1, &nsegs, BUS_DMA_WAITOK | BUS_DMA_ZERO))
++	if (rk->rk_alloc) {
++		kva = NULL;
++		cookie = NULL;
++		addr = (bus_addr_t)-1;
++		error = rk->rk_alloc(rk->rk_cookie, size, &kva, &addr, &cookie);
++		if (error) {
++			rtkit_protocol_fault(state, error);
++			return (bus_addr_t)-1;
++		}
++		/* Accept a 44-bit address or its canonical high-half form. */
++		if (addr > 0xfffffffffffULL &&
++		    ((addr | 0xfffffffffffULL) != 0xffffffffffffffffULL ||
++		    (addr & 0x80000000000ULL) == 0)) {
++			rk->rk_free(rk->rk_cookie, cookie);
++			return (bus_addr_t)-1;
++		}
++		addr &= 0xfffffffffffULL;
++		if (kva == NULL || cookie == NULL || addr == 0 ||
++		    (addr & (PAGE_SIZE - 1)) != 0 ||
++		    size > 0x100000000000ULL - addr) {
++			rk->rk_free(rk->rk_cookie, cookie);
++			return (bus_addr_t)-1;
++		}
++		state->dmamem[state->ndmamem].rdm_cookie = cookie;
++		state->dmamem[state->ndmamem].rdm_external = 1;
++		state->ndmamem++;
++		*kvap = kva;
++		return addr;
++	}
++
++	error = bus_dmamem_alloc(rk->rk_dmat, size, 16384, 0,
++	    &seg, 1, &nsegs, dmaflags | BUS_DMA_ZERO);
++	if (error) {
++		rtkit_protocol_fault(state, error);
+ 		return (bus_addr_t)-1;
++	}
+ 
+-	if (bus_dmamem_map(rk->rk_dmat, &seg, 1, size,
+-	    &kva, BUS_DMA_WAITOK | BUS_DMA_COHERENT)) {
++	error = bus_dmamem_map(rk->rk_dmat, &seg, 1, size,
++	    &kva, dmaflags | BUS_DMA_COHERENT);
++	if (error) {
++		rtkit_protocol_fault(state, error);
+ 		bus_dmamem_free(rk->rk_dmat, &seg, 1);
+ 		return (bus_addr_t)-1;
+ 	}
+ 
+-	if (bus_dmamap_create(rk->rk_dmat, size, 1, size, 0,
+-	    BUS_DMA_WAITOK, &map)) {
++	error = bus_dmamap_create(rk->rk_dmat, size, 1, size, 0,
++	    dmaflags, &map);
++	if (error) {
++		rtkit_protocol_fault(state, error);
+ 		bus_dmamem_unmap(rk->rk_dmat, kva, size);
+ 		bus_dmamem_free(rk->rk_dmat, &seg, 1);
+ 		return (bus_addr_t)-1;
+ 	}
+ 
+-	if (bus_dmamap_load_raw(rk->rk_dmat, map, &seg, 1, size,
+-	    BUS_DMA_WAITOK)) {
++	error = bus_dmamap_load_raw(rk->rk_dmat, map, &seg, 1, size,
++	    dmaflags);
++	if (error) {
++		rtkit_protocol_fault(state, error);
++		bus_dmamap_destroy(rk->rk_dmat, map);
++		bus_dmamem_unmap(rk->rk_dmat, kva, size);
++		bus_dmamem_free(rk->rk_dmat, &seg, 1);
++		return (bus_addr_t)-1;
++	}
++	addr = map->dm_segs[0].ds_addr;
++	if (addr == 0 || addr > 0xfffffffffffULL ||
++	    (addr & (PAGE_SIZE - 1)) != 0 ||
++	    size > 0x100000000000ULL - addr) {
++		bus_dmamap_unload(rk->rk_dmat, map);
+ 		bus_dmamap_destroy(rk->rk_dmat, map);
+ 		bus_dmamem_unmap(rk->rk_dmat, kva, size);
+ 		bus_dmamem_free(rk->rk_dmat, &seg, 1);
+@@ -196,7 +569,9 @@ rtkit_alloc(struct rtkit_state *state, b
+ 	}
+ 
+ 	if (rk->rk_map) {
+-		if (rk->rk_map(rk->rk_cookie, seg.ds_addr, seg.ds_len)) {
++		error = rk->rk_map(rk->rk_cookie, seg.ds_addr, seg.ds_len);
++		if (error) {
++			rtkit_protocol_fault(state, error);
+ 			bus_dmamap_unload(rk->rk_dmat, map);
+ 			bus_dmamap_destroy(rk->rk_dmat, map);
+ 			bus_dmamem_unmap(rk->rk_dmat, kva, size);
+@@ -205,6 +580,7 @@ rtkit_alloc(struct rtkit_state *state, b
+ 		}
+ 	}
+ 
++	state->dmamem[state->ndmamem].rdm_external = 0;
+ 	state->dmamem[state->ndmamem].rdm_map = map;
+ 	state->dmamem[state->ndmamem].rdm_seg = seg;
+ 	state->dmamem[state->ndmamem].rdm_size = size;
+@@ -212,7 +588,47 @@ rtkit_alloc(struct rtkit_state *state, b
+ 	state->ndmamem++;
+ 
+ 	*kvap = kva;
+-	return map->dm_segs[0].ds_addr;
++	return addr;
++}
++
++/* Firmware owns these pages; only the kernel virtual mapping is ours. */
++static int
++rtkit_map_firmware(struct rtkit_state *state, bus_addr_t addr,
++    bus_size_t size, caddr_t *kvap)
++{
++	struct rtkit *rk = state->rk;
++	paddr_t pa;
++	vaddr_t va;
++	caddr_t kva;
++	bus_size_t mapsize, off;
++
++	if (size == 0 || size > SIZE_MAX - PAGE_MASK || (addr & PAGE_MASK))
++		return EINVAL;
++	if (state->ndmamem >= nitems(state->dmamem))
++		return ENOBUFS;
++	if (rk == NULL || rk->rk_logmap == NULL ||
++	    (cold && !rk->rk_logmap_nosleep))
++		return EOPNOTSUPP;
++	pa = rk->rk_logmap(rk->rk_cookie, addr, size);
++	if (pa == (paddr_t)-1)
++		return EFAULT;
++	if ((pa & PAGE_MASK & ~(PMAP_NOCACHE | PMAP_DEVICE)) != 0)
++		return EINVAL;
++	mapsize = round_page(size);
++	kva = km_alloc(mapsize, &kv_any, &kp_none,
++	    cold ? &kd_trylock : &kd_waitok);
++	if (kva == NULL)
++		return ENOMEM;
++	va = (vaddr_t)kva;
++	for (off = 0; off < mapsize; off += PAGE_SIZE)
++		pmap_kenter_pa(va + off, pa + off, PROT_READ | PROT_WRITE);
++	pmap_update(pmap_kernel());
++	state->dmamem[state->ndmamem].rdm_external = 2;
++	state->dmamem[state->ndmamem].rdm_kva = kva;
++	state->dmamem[state->ndmamem].rdm_size = mapsize;
++	state->ndmamem++;
++	*kvap = kva;
++	return 0;
+ }
+ 
+ int
+@@ -222,14 +638,15 @@ rtkit_start(struct rtkit_state *state, u
+ 
+ 	reply = ((uint64_t)endpoint << RTKIT_MGMT_STARTEP_EP_SHIFT);
+ 	reply |= RTKIT_MGMT_STARTEP_START;
+-	return rtkit_send(state, RTKIT_EP_MGMT, RTKIT_MGMT_STARTEP, reply);
++	return rtkit_send_reply(state, RTKIT_EP_MGMT, RTKIT_MGMT_STARTEP,
++	    reply);
+ }
+ 
+ int
+ rtkit_handle_mgmt(struct rtkit_state *state, struct aplmbox_msg *msg)
+ {
+ 	uint64_t minver, maxver, ver;
+-	uint64_t base, bitmap, reply;
++	uint64_t base, bitmap, reply, oldmap;
+ 	uint32_t endpoint;
+ 	int error;
+ 
+@@ -237,7 +654,7 @@ rtkit_handle_mgmt(struct rtkit_state *st
+ 	case RTKIT_MGMT_HELLO:
+ 		minver = RTKIT_MGMT_HELLO_MINVER(msg->data0);
+ 		maxver = RTKIT_MGMT_HELLO_MAXVER(msg->data0);
+-		if (minver > RTKIT_MAXVER) {
++		if (minver > maxver || minver > RTKIT_MAXVER) {
+ 			printf("%s: unsupported minimum firmware version %lld\n",
+ 			    __func__, minver);
+ 			return EINVAL;
+@@ -248,36 +665,47 @@ rtkit_handle_mgmt(struct rtkit_state *st
+ 			return EINVAL;
+ 		}
+ 		ver = min(RTKIT_MAXVER, maxver);
+-		error = rtkit_send(state, RTKIT_EP_MGMT, RTKIT_MGMT_HELLO_ACK,
++		error = rtkit_send_reply(state, RTKIT_EP_MGMT, RTKIT_MGMT_HELLO_ACK,
+ 		    (ver << RTKIT_MGMT_HELLO_MINVER_SHIFT) |
+ 		    (ver << RTKIT_MGMT_HELLO_MAXVER_SHIFT));
+ 		if (error)
+ 			return error;
+ 		break;
+ 	case RTKIT_MGMT_IOP_PWR_STATE_ACK:
+-		state->iop_pwrstate = RTKIT_MGMT_PWR_STATE(msg->data0);
++		__atomic_store_n(&state->iop_pwrstate,
++		    RTKIT_MGMT_PWR_STATE(msg->data0), __ATOMIC_RELEASE);
++		atomic_setbits_int(&state->power_ack_seen, 1);
+ 		wakeup(&state->iop_pwrstate);
+ 		break;
+ 	case RTKIT_MGMT_AP_PWR_STATE:
+-		state->ap_pwrstate = RTKIT_MGMT_PWR_STATE(msg->data0);
++		__atomic_store_n(&state->ap_pwrstate,
++		    RTKIT_MGMT_PWR_STATE(msg->data0), __ATOMIC_RELEASE);
++		atomic_setbits_int(&state->power_ack_seen, 2);
+ 		wakeup(&state->ap_pwrstate);
+ 		break;
+ 	case RTKIT_MGMT_EPMAP:
+ 		base = RTKIT_MGMT_EPMAP_BASE(msg->data0);
+ 		bitmap = RTKIT_MGMT_EPMAP_BITMAP(msg->data0);
+-		state->epmap |= (bitmap << (base * 32));
++		if (base < 2) {
++			oldmap = __atomic_load_n(&state->epmap, __ATOMIC_RELAXED);
++			while (!__atomic_compare_exchange_n(&state->epmap, &oldmap,
++			    oldmap | (bitmap << (base * 32)), 0,
++			    __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
++				;
++		}
+ 		reply = (base << RTKIT_MGMT_EPMAP_BASE_SHIFT);
+ 		if (msg->data0 & RTKIT_MGMT_EPMAP_LAST)
+ 			reply |= RTKIT_MGMT_EPMAP_LAST;
+ 		else
+ 			reply |= RTKIT_MGMT_EPMAP_MORE;
+-		error = rtkit_send(state, RTKIT_EP_MGMT,
++		error = rtkit_send_reply(state, RTKIT_EP_MGMT,
+ 		    RTKIT_MGMT_EPMAP, reply);
+ 		if (error)
+ 			return error;
+ 		if (msg->data0 & RTKIT_MGMT_EPMAP_LAST) {
+ 			for (endpoint = 1; endpoint < 32; endpoint++) {
+-				if ((state->epmap & (1ULL << endpoint)) == 0)
++				if ((__atomic_load_n(&state->epmap, __ATOMIC_ACQUIRE) &
++				    (1ULL << endpoint)) == 0)
+ 					continue;
+ 
+ 				switch (endpoint) {
+@@ -286,18 +714,19 @@ rtkit_handle_mgmt(struct rtkit_state *st
+ 				case RTKIT_EP_DEBUG:
+ 				case RTKIT_EP_IOREPORT:
+ 				case RTKIT_EP_OSLOG:
++				case RTKIT_EP_TRACEKIT:
+ 					error = rtkit_start(state, endpoint);
+ 					if (error)
+ 						return error;
+ 					break;
+-				case RTKIT_EP_UNKNOWN:
+-					break;
+ 				default:
+ 					printf("%s: skipping endpoint %d\n",
+ 					    __func__, endpoint);
+ 					break;
+ 				}
+ 			}
++			__atomic_store_n(&state->epmap_complete, 1, __ATOMIC_RELEASE);
++			wakeup(&state->epmap_complete);
+ 		}
+ 		break;
+ 	default:
+@@ -345,12 +774,13 @@ struct rtkit_crashlog_rg8 {
+ void
+ rtkit_crashlog_dump_str(char *buf, size_t size)
+ {
+-	char *end = buf + size - 1;
++	char *end;
+ 	char *newl;
+ 	uint32_t idx;
+ 
+ 	if (size < 5)
+ 		return;
++	end = buf + size - 1;
+ 
+ 	idx = lemtoh32((uint32_t *)buf);
+ 	buf += sizeof(uint32_t);
+@@ -359,7 +789,7 @@ rtkit_crashlog_dump_str(char *buf, size_
+ 	while (buf < end) {
+ 		if (*buf == 0)
+ 			return;
+-		newl = memchr(buf, '\n', buf - end);
++		newl = memchr(buf, '\n', end - buf);
+ 		if (newl)
+ 			*newl = 0;
+ 		printf("RTKit Cstr %x: %s\n", idx, buf);
+@@ -372,10 +802,25 @@ rtkit_crashlog_dump_str(char *buf, size_
+ void
+ rtkit_crashlog_dump_ver(char *buf, size_t size)
+ {
+-	char *end = buf + size - 1;
++	char *end;
++#ifdef AOP_CRASH_DIAG
++	const uint8_t *uuid;
++#endif
+ 
+ 	if (size < 17)
+ 		return;
++#ifdef AOP_CRASH_DIAG
++	uuid = (const uint8_t *)buf;
++	printf("RTKit Cver UUID %02x%02x%02x%02x-%02x%02x-%02x%02x-"
++	    "%02x%02x-%02x%02x%02x%02x%02x%02x\n",
++	    (unsigned)uuid[0], (unsigned)uuid[1], (unsigned)uuid[2],
++	    (unsigned)uuid[3], (unsigned)uuid[4], (unsigned)uuid[5],
++	    (unsigned)uuid[6], (unsigned)uuid[7], (unsigned)uuid[8],
++	    (unsigned)uuid[9], (unsigned)uuid[10], (unsigned)uuid[11],
++	    (unsigned)uuid[12], (unsigned)uuid[13], (unsigned)uuid[14],
++	    (unsigned)uuid[15]);
++#endif
++	end = buf + size - 1;
+ 
+ 	buf += 16;
+ 
+@@ -389,10 +834,15 @@ rtkit_crashlog_dump_mbx(char *buf, size_
+ 	struct rtkit_crashlog_mbx mbx;
+ 	char *end = buf + size;
+ 
++	if (size < 28)
++		return;
++	printf("RTKit Cmbx: type=%u index=%u\n",
++	    lemtoh32((uint32_t *)(buf + 16)),
++	    lemtoh32((uint32_t *)(buf + 24)));
++
+ 	buf += 28;
+-	size -= 28;
+ 
+-	while (buf + sizeof(mbx) <= end) {
++	while ((size_t)(end - buf) >= sizeof(mbx)) {
+ 		memcpy(&mbx, buf, sizeof(mbx));
+ 		printf("RTKit Cmbx: 0x%016llx 0x%016llx @0x%08x\n",
+ 		    mbx.msg0, mbx.msg1, mbx.timestamp);
+@@ -419,6 +869,128 @@ rtkit_crashlog_dump_rg8(char *buf, size_
+ 		printf("RTKit Crg8: reg[%d] %016llx\n", i, rg8.reg[i]);
+ }
+ 
++#ifdef AOP_CRASH_DIAG
++/* Report only a bounded range comparison, never the raw FAR-adjacent word. */
++static void
++rtkit_crashlog_diag(const char *buf, size_t total)
++{
++	struct rtkit_crashlog_mbx mbx;
++	uint64_t value = 0, base = 0, message, endpoint;
++	uint32_t fourcc, secsize, reqsize = 0, reqtime = 0;
++	size_t off, pos, payload, reqpos = 0, tail, end;
++	unsigned int crg = 0, cmbx = 0, requests = 0, replies = 0;
++	unsigned int req_ep = 0;
++	int footer = 0, paired = 0;
++	const char *reason = "ambiguous sections or events";
++
++	for (off = sizeof(struct rtkit_crashlog_header); off < total;
++	    off += secsize) {
++		if (total - off < 16) {
++			reason = "truncated section header";
++			goto unknown;
++		}
++		fourcc = lemtoh32((const uint32_t *)(buf + off));
++		if (fourcc == RTKIT_FOURCC("CLHE")) {
++			if (total - off != sizeof(struct rtkit_crashlog_header) ||
++			    memcmp(buf, buf + off,
++			    sizeof(struct rtkit_crashlog_header)) != 0) {
++				reason = "invalid crashlog footer";
++				goto unknown;
++			}
++			footer = 1;
++			break;
++		}
++		secsize = lemtoh32((const uint32_t *)(buf + off + 12));
++		if (secsize < 16 || secsize > total - off) {
++			reason = "invalid section size";
++			goto unknown;
++		}
++		payload = off + 16;
++		if (fourcc == RTKIT_FOURCC("Crg8")) {
++			if (secsize - 16 < sizeof(struct rtkit_crashlog_rg8)) {
++				reason = "short register section";
++				goto unknown;
++			}
++			memcpy(&value, buf + payload +
++			    offsetof(struct rtkit_crashlog_rg8, unknown1),
++			    sizeof(value));
++			value = letoh64(value);
++			crg++;
++		} else if (fourcc == RTKIT_FOURCC("Cmbx")) {
++			cmbx++;
++			if (secsize - 16 < 28) {
++				reason = "short mailbox section";
++				goto unknown;
++			}
++			if (lemtoh32((const uint32_t *)(buf + payload + 16)) != 0 ||
++			    lemtoh32((const uint32_t *)(buf + payload + 24)) != 0) {
++				reason = "unsupported mailbox type or index";
++				goto unknown;
++			}
++			tail = (secsize - 16 - 28) % sizeof(mbx);
++			end = off + secsize;
++			/* The RTKit writer pads section payloads to 16 bytes. */
++			if (tail >= 16 || (secsize - 16) % 16) {
++				reason = "invalid mailbox padding";
++				goto unknown;
++			}
++			for (pos = end - tail; pos < end; pos++) {
++				if (buf[pos] != 0) {
++					reason = "nonzero mailbox padding";
++					goto unknown;
++				}
++			}
++			end -= tail;
++			for (pos = payload + 28; pos < end;
++			    pos += sizeof(mbx)) {
++				memcpy(&mbx, buf + pos, sizeof(mbx));
++				message = letoh64(mbx.msg0);
++				endpoint = letoh64(mbx.msg1);
++				if (endpoint < 0x20 || endpoint >= 0x2f)
++					continue;
++				if ((message >> 48) == 0x89) {
++					requests++;
++					req_ep = endpoint;
++					reqsize = ((message >> 16) & 0xffff) * 64;
++					reqtime = letoh32(mbx.timestamp);
++					reqpos = pos;
++				} else if ((message >> 48) == 0xa1) {
++					replies++;
++					if (requests == 1 && replies == 1 &&
++					    endpoint == req_ep && reqsize != 0 &&
++					    pos - reqpos == sizeof(mbx) &&
++					    letoh32(mbx.timestamp) >= reqtime) {
++						base = message & ((1ULL << 48) - 1);
++						paired = base != 0 &&
++						    reqsize <= (1ULL << 48) - base;
++					}
++				}
++			}
++		}
++	}
++	if (!footer) {
++		reason = "missing crashlog footer";
++		goto unknown;
++	}
++	if (crg != 1 || cmbx != 1 || requests != 1 || replies != 1 ||
++	    !paired)
++		goto unknown;
++	if (value == UINT64_MAX)
++		printf("RTKit diag: FAR-adjacent word is all ones\n");
++	else if (value >= base && value - base < reqsize)
++		printf("RTKit diag: FAR-adjacent word numerically matches "
++		    "the sole recorded AFK buffer range\n");
++	else
++		printf("RTKit diag: FAR-adjacent word does not numerically "
++		    "match the sole recorded AFK buffer range\n");
++	return;
++unknown:
++	printf("RTKit diag: FAR-adjacent range comparison unavailable "
++	    "(%s; reg=%u mbox=%u requests=%u replies=%u)\n", reason,
++	    crg, cmbx, requests, replies);
++}
++#endif
++
+ void
+ rtkit_crashlog_dump(char *buf, size_t size)
+ {
+@@ -434,7 +1006,7 @@ rtkit_crashlog_dump(char *buf, size_t si
+ 		return;
+ 	}
+ 
+-	if (letoh32(hdr.size) > size) {
++	if (letoh32(hdr.size) < sizeof(hdr) || letoh32(hdr.size) > size) {
+ 		printf("RTKit: Invalid header size\n");
+ 		return;
+ 	}
+@@ -443,8 +1015,12 @@ rtkit_crashlog_dump(char *buf, size_t si
+ 	while (off < letoh32(hdr.size)) {
+ 		uint32_t fourcc, size;
+ 
++		if (letoh32(hdr.size) - off < 16)
++			break;
+ 		fourcc = lemtoh32((uint32_t *)(buf + off));
+ 		size = lemtoh32((uint32_t *)(buf + off + 12));
++		if (size < 16 || size > letoh32(hdr.size) - off)
++			break;
+ 		if (fourcc == RTKIT_FOURCC("CLHE"))
+ 			break;
+ 		if (fourcc == RTKIT_FOURCC("Cstr"))
+@@ -457,6 +1033,9 @@ rtkit_crashlog_dump(char *buf, size_t si
+ 			rtkit_crashlog_dump_rg8(buf + off + 16, size - 16);
+ 		off += size;
+ 	}
++#ifdef AOP_CRASH_DIAG
++	rtkit_crashlog_diag(buf, letoh32(hdr.size));
++#endif
+ }
+ 
+ void
+@@ -464,80 +1043,159 @@ rtkit_handle_crashlog_buffer(void *arg)
+ {
+ 	struct rtkit_state *state = arg;
+ 	struct rtkit *rk = state->rk;
+-	bus_addr_t addr = state->crashlog_addr;
+-	bus_size_t size = state->crashlog_size;
++	bus_addr_t addr;
++	bus_size_t size, left;
++	char *buf = NULL;
++	int error, external_map = 0;
++
++	mtx_enter(&state->crashlog_mtx);
++	if (state->crashlog_state != RTKIT_CRASHLOG_PENDING) {
++		mtx_leave(&state->crashlog_mtx);
++		return;
++	}
++	addr = state->crashlog_addr;
++	size = state->crashlog_size;
++	mtx_leave(&state->crashlog_mtx);
++	if (size == 0 || (addr & PAGE_MASK) != 0) {
++		rtkit_protocol_fault(state, EINVAL);
++		return;
++	}
+ 
+ 	if (addr) {
+-		paddr_t pa = addr | PMAP_NOCACHE;
++		paddr_t pa;
+ 		vaddr_t va;
+ 
+-		if (rk && rk->rk_logmap) {
+-			pa = rk->rk_logmap(rk->rk_cookie, addr);
+-			if (pa == (paddr_t)-1)
+-				return;
++		if (rk == NULL || rk->rk_logmap == NULL ||
++		    (cold && !rk->rk_logmap_nosleep)) {
++			rtkit_protocol_fault(state, EOPNOTSUPP);
++			return;
+ 		}
+-
+-		state->crashlog = km_alloc(size * PAGE_SIZE,
+-		    &kv_any, &kp_none, &kd_waitok);
+-		va = (vaddr_t)state->crashlog;
+-
+-		while (size-- > 0) {
++		pa = rk->rk_logmap(rk->rk_cookie, addr, size * PAGE_SIZE);
++		if (pa == (paddr_t)-1) {
++			rtkit_protocol_fault(state, EFAULT);
++			return;
++		}
++		if ((pa & PAGE_MASK & ~(PMAP_NOCACHE | PMAP_DEVICE)) != 0) {
++			rtkit_protocol_fault(state, EINVAL);
++			return;
++		}
++		buf = km_alloc(size * PAGE_SIZE, &kv_any, &kp_none,
++		    cold ? &kd_trylock : &kd_waitok);
++		if (buf == NULL) {
++			printf("%s: cannot map crashlog buffer\n", state->node_name);
++			rtkit_protocol_fault(state, ENOMEM);
++			return;
++		}
++		va = (vaddr_t)buf;
++		for (left = size; left != 0; left--) {
+ 			pmap_kenter_pa(va, pa, PROT_READ);
+ 			va += PAGE_SIZE;
+ 			pa += PAGE_SIZE;
+ 		}
++		pmap_update(pmap_kernel());
++		external_map = 1;
++	} else if (rk) {
++		addr = rtkit_alloc(state, size << PAGE_SHIFT, &buf);
++		if (addr == (bus_addr_t)-1) {
++			rtkit_protocol_fault(state, ENOMEM);
++			return;
++		}
++	} else {
++		rtkit_protocol_fault(state, ENXIO);
+ 		return;
+ 	}
+ 
+-	if (rk) {
+-		addr = rtkit_alloc(state, size << PAGE_SHIFT,
+-		    &state->crashlog);
+-		if (addr == (bus_addr_t)-1)
+-			return;
++	/* Publish only a fully mapped buffer.  A crash can arrive during the
++	 * allocation, in which case retain it but never send a late reply. */
++	mtx_enter(&state->crashlog_mtx);
++	state->crashlog = buf;
++	state->crashlog_external_map = external_map;
++	if (state->crashlog_state == RTKIT_CRASHLOG_PENDING) {
++		state->crashlog_state = RTKIT_CRASHLOG_READY;
++		if (!external_map) {
++			error = rtkit_send_reply(state, RTKIT_EP_CRASHLOG,
++			    RTKIT_BUFFER_REQUEST,
++			    (size << RTKIT_BUFFER_SIZE_SHIFT) | addr);
++			if (error && error != ECANCELED)
++				rtkit_protocol_fault(state, error);
++		}
+ 	}
++	mtx_leave(&state->crashlog_mtx);
++}
+ 
+-	rtkit_send(state, RTKIT_EP_CRASHLOG, RTKIT_BUFFER_REQUEST,
+-	    (size << RTKIT_BUFFER_SIZE_SHIFT) | addr);
++static void
++rtkit_report_crash(struct rtkit_state *state)
++{
++	struct rtkit *rk = state->rk;
++	volatile uint8_t *src;
++	char *buf = NULL;
++	bus_size_t size = 0, i;
++
++	mtx_enter(&state->crashlog_mtx);
++	src = (volatile uint8_t *)state->crashlog;
++	if (src != NULL)
++		size = state->crashlog_size * PAGE_SIZE;
++	mtx_leave(&state->crashlog_mtx);
++	/* RX quiescence or the worker barrier keeps this mapping alive. */
++	if (size != 0) {
++		buf = malloc(size, M_TEMP, M_NOWAIT);
++		if (buf != NULL) {
++			for (i = 0; i < size; i++)
++				buf[i] = src[i];
++		}
++	}
++	printf("\nRTKit crashed: node %s phandle 0x%x\n",
++	    state->node_name, state->node_phandle);
++	if (rk && rk->rk_crashed)
++		rk->rk_crashed(rk->rk_cookie, buf, buf ? size : 0);
++	if (buf != NULL) {
++		rtkit_crashlog_dump(buf, size);
++		free(buf, M_TEMP, size);
++	}
+ }
+ 
+ int
+ rtkit_handle_crashlog(struct rtkit_state *state, struct aplmbox_msg *msg)
+ {
+-	bus_addr_t addr;
+-	bus_size_t size;
++	u_int i, j, at, next;
++	int setup = 0, crashed = 0;
+ 
+-	switch (RTKIT_MGMT_TYPE(msg->data0)) {
+-	case RTKIT_BUFFER_REQUEST:
+-		addr = RTKIT_BUFFER_ADDR(msg->data0);
+-		size = RTKIT_BUFFER_SIZE(msg->data0);
+-
+-		if (state->crashlog) {
+-			char *buf;
+-
+-			printf("\nRTKit crashed:\n");
+-
+-			buf = malloc(size * PAGE_SIZE, M_TEMP, M_NOWAIT);
+-			if (buf) {
+-				memcpy(buf, state->crashlog, size * PAGE_SIZE);
+-				rtkit_crashlog_dump(buf, size * PAGE_SIZE);
+-				free(buf, M_TEMP, size * PAGE_SIZE);
++	if (RTKIT_MGMT_TYPE(msg->data0) != RTKIT_BUFFER_REQUEST) {
++		printf("%s: unhandled crashlog event 0x%016llx\n",
++		    __func__, msg->data0);
++		return 0;
++	}
++	mtx_enter(&state->crashlog_mtx);
++	if (state->crashlog_state == RTKIT_CRASHLOG_IDLE) {
++		state->crashlog_addr = RTKIT_BUFFER_ADDR(msg->data0);
++		state->crashlog_size = RTKIT_BUFFER_SIZE(msg->data0);
++		state->crashlog_state = RTKIT_CRASHLOG_PENDING;
++		setup = 1;
++	} else if (state->crashlog_state == RTKIT_CRASHLOG_PENDING ||
++	    state->crashlog_state == RTKIT_CRASHLOG_READY) {
++		state->crashlog_state = RTKIT_CRASHLOG_CRASHED;
++		/* A queued reply has not reached firmware and is now stale. */
++		mtx_enter(&state->send_mtx);
++		for (i = 0; i < state->reply_count; i++) {
++			at = (state->reply_head + i) % RTKIT_REPLY_QUEUE_SIZE;
++			if (state->reply_queue[at].data1 != RTKIT_EP_CRASHLOG)
++				continue;
++			for (j = i; j + 1 < state->reply_count; j++) {
++				at = (state->reply_head + j) % RTKIT_REPLY_QUEUE_SIZE;
++				next = (at + 1) % RTKIT_REPLY_QUEUE_SIZE;
++				state->reply_queue[at] = state->reply_queue[next];
+ 			}
++			state->reply_count--;
+ 			break;
+ 		}
+-
+-		state->crashlog_addr = addr;
+-		state->crashlog_size = size;
+-		if (cold)
+-			rtkit_handle_crashlog_buffer(state);
+-		else
+-			task_add(systq, &state->crashlog_task);
+-		break;
+-	default:
+-		printf("%s: unhandled crashlog event 0x%016llx\n",
+-		    __func__, msg->data0);
+-		break;
++		mtx_leave(&state->send_mtx);
++		crashed = 1;
+ 	}
+-
++	mtx_leave(&state->crashlog_mtx);
++	if (setup && cold)
++		rtkit_handle_crashlog_buffer(state);
++	else if (crashed && cold)
++		rtkit_report_crash(state);
+ 	return 0;
+ }
+ 
+@@ -545,26 +1203,35 @@ void
+ rtkit_handle_syslog_log(struct rtkit_state *state, struct aplmbox_msg *msg)
+ {
+ 	char context[24];
+-	size_t syslog_msg_size;
+-	char *syslog_msg;
+-	int idx, pos;
++	size_t syslog_msg_size, offset, available;
++	char *syslog;
++	volatile uint8_t *syslog_msg;
++	int idx, pos, i;
+ 
+ 	if ((state->flags & RK_SYSLOG) == 0)
+ 		return;
+ 
+-	if (state->syslog_msg == NULL)
++	if (state->syslog_msg == NULL || state->syslog_msg_size == 0)
+ 		return;
+ 	idx = RTKIT_SYSLOG_LOG_IDX(msg->data0);
+-	if (idx > state->syslog_n_entries)
++	if (idx >= state->syslog_n_entries)
+ 		return;
+ 
++	syslog = __atomic_load_n(&state->syslog, __ATOMIC_ACQUIRE);
+ 	syslog_msg_size = state->syslog_msg_size + 32;
+-	syslog_msg = state->syslog + (idx * syslog_msg_size + 8);
+-	memcpy(context, syslog_msg, sizeof(context));
++	offset = idx * syslog_msg_size;
++	available = state->syslog_size << PAGE_SHIFT;
++	if (syslog == NULL || offset > available ||
++	    syslog_msg_size > available - offset)
++		return;
++	syslog_msg = (volatile uint8_t *)syslog + offset + 8;
++	for (i = 0; i < sizeof(context); i++)
++		context[i] = syslog_msg[i];
+ 	context[sizeof(context) - 1] = 0;
+ 
+ 	syslog_msg += sizeof(context);
+-	memcpy(state->syslog_msg, syslog_msg, state->syslog_msg_size);
++	for (i = 0; i < state->syslog_msg_size; i++)
++		state->syslog_msg[i] = syslog_msg[i];
+ 	state->syslog_msg[state->syslog_msg_size - 1] = 0;
+ 
+ 	pos = strlen(state->syslog_msg) - 1;
+@@ -586,16 +1253,34 @@ rtkit_handle_syslog_buffer(void *arg)
+ 	struct rtkit *rk = state->rk;
+ 	bus_addr_t addr = state->syslog_addr;
+ 	bus_size_t size = state->syslog_size;
++	char *buf = NULL;
++	int error;
+ 
++	if (addr) {
++		error = rtkit_map_firmware(state, addr, size << PAGE_SHIFT, &buf);
++		if (error)
++			rtkit_protocol_fault(state, error);
++		else
++			__atomic_store_n(&state->syslog, buf, __ATOMIC_RELEASE);
++		return;
++	}
+ 	if (rk) {
+-		addr = rtkit_alloc(state, size << PAGE_SHIFT,
+-		    &state->syslog);
+-		if (addr == (bus_addr_t)-1)
++		addr = rtkit_alloc(state, size << PAGE_SHIFT, &buf);
++		if (addr == (bus_addr_t)-1) {
++			rtkit_protocol_fault(state, ENOMEM);
+ 			return;
++		}
++		state->syslog_reply_addr = addr;
++		__atomic_store_n(&state->syslog, buf, __ATOMIC_RELEASE);
++	} else {
++		rtkit_protocol_fault(state, ENXIO);
++		return;
+ 	}
+ 
+-	rtkit_send(state, RTKIT_EP_SYSLOG, RTKIT_BUFFER_REQUEST,
++	error = rtkit_send_reply(state, RTKIT_EP_SYSLOG, RTKIT_BUFFER_REQUEST,
+ 	    (size << RTKIT_BUFFER_SIZE_SHIFT) | addr);
++	if (error)
++		rtkit_protocol_fault(state, error);
+ }
+ 
+ int
+@@ -609,27 +1294,43 @@ rtkit_handle_syslog(struct rtkit_state *
+ 	case RTKIT_BUFFER_REQUEST:
+ 		addr = RTKIT_BUFFER_ADDR(msg->data0);
+ 		size = RTKIT_BUFFER_SIZE(msg->data0);
+-		if (addr)
++		if (state->syslog != NULL) {
++			if (size != state->syslog_size ||
++			    (addr != state->syslog_addr &&
++			    (addr != state->syslog_reply_addr ||
++			    state->syslog_addr != 0)))
++				return EBUSY;
++			if (state->syslog_addr == 0)
++				return rtkit_send_reply(state, RTKIT_EP_SYSLOG,
++				    RTKIT_BUFFER_REQUEST,
++				    (size << RTKIT_BUFFER_SIZE_SHIFT) |
++				    state->syslog_reply_addr);
+ 			break;
++		}
+ 
+ 		state->syslog_addr = addr;
+ 		state->syslog_size = size;
+-		if (cold)
+-			rtkit_handle_syslog_buffer(state);
+-		else
+-			task_add(systq, &state->syslog_task);
++		rtkit_handle_syslog_buffer(state);
+ 		break;
+ 	case RTKIT_SYSLOG_INIT:
++		if (state->syslog_msg != NULL) {
++			free(state->syslog_msg, M_DEVBUF, state->syslog_msg_size);
++			state->syslog_msg = NULL;
++		}
+ 		state->syslog_n_entries =
+ 		    RTKIT_SYSLOG_INIT_N_ENTRIES(msg->data0);
+ 		state->syslog_msg_size =
+ 		    RTKIT_SYSLOG_INIT_MSG_SIZE(msg->data0);
+-		state->syslog_msg = malloc(state->syslog_msg_size,
+-		    M_DEVBUF, M_NOWAIT);
++		if (state->syslog_msg_size != 0) {
++			state->syslog_msg = malloc(state->syslog_msg_size,
++			    M_DEVBUF, M_NOWAIT);
++			if (state->syslog_msg == NULL)
++				return ENOMEM;
++		}
+ 		break;
+ 	case RTKIT_SYSLOG_LOG:
+ 		rtkit_handle_syslog_log(state, msg);
+-		error = rtkit_send(state, RTKIT_EP_SYSLOG,
++		error = rtkit_send_reply(state, RTKIT_EP_SYSLOG,
+ 		    RTKIT_MGMT_TYPE(msg->data0), msg->data0);
+ 		if (error)
+ 			return error;
+@@ -650,16 +1351,32 @@ rtkit_handle_ioreport_buffer(void *arg)
+ 	struct rtkit *rk = state->rk;
+ 	bus_addr_t addr = state->ioreport_addr;
+ 	bus_size_t size = state->ioreport_size;
++	int error;
+ 
++	if (addr) {
++		error = rtkit_map_firmware(state, addr, size << PAGE_SHIFT,
++		    &state->ioreport);
++		if (error)
++			rtkit_protocol_fault(state, error);
++		return;
++	}
+ 	if (rk) {
+ 		addr = rtkit_alloc(state, size << PAGE_SHIFT,
+ 		    &state->ioreport);
+-		if (addr == (bus_addr_t)-1)
++		if (addr == (bus_addr_t)-1) {
++			rtkit_protocol_fault(state, ENOMEM);
+ 			return;
++		}
++		state->ioreport_reply_addr = addr;
++	} else {
++		rtkit_protocol_fault(state, ENXIO);
++		return;
+ 	}
+ 
+-	rtkit_send(state, RTKIT_EP_IOREPORT, RTKIT_BUFFER_REQUEST,
++	error = rtkit_send_reply(state, RTKIT_EP_IOREPORT, RTKIT_BUFFER_REQUEST,
+ 	    (size << RTKIT_BUFFER_SIZE_SHIFT) | addr);
++	if (error)
++		rtkit_protocol_fault(state, error);
+ }
+ 
+ int
+@@ -673,20 +1390,28 @@ rtkit_handle_ioreport(struct rtkit_state
+ 	case RTKIT_BUFFER_REQUEST:
+ 		addr = RTKIT_BUFFER_ADDR(msg->data0);
+ 		size = RTKIT_BUFFER_SIZE(msg->data0);
+-		if (addr)
++		if (state->ioreport != NULL) {
++			if (size != state->ioreport_size ||
++			    (addr != state->ioreport_addr &&
++			    (addr != state->ioreport_reply_addr ||
++			    state->ioreport_addr != 0)))
++				return EBUSY;
++			if (state->ioreport_addr == 0)
++				return rtkit_send_reply(state, RTKIT_EP_IOREPORT,
++				    RTKIT_BUFFER_REQUEST,
++				    (size << RTKIT_BUFFER_SIZE_SHIFT) |
++				    state->ioreport_reply_addr);
+ 			break;
++		}
+ 
+ 		state->ioreport_addr = addr;
+ 		state->ioreport_size = size;
+-		if (cold)
+-			rtkit_handle_ioreport_buffer(state);
+-		else
+-			task_add(systq, &state->ioreport_task);
++		rtkit_handle_ioreport_buffer(state);
+ 		break;
+ 	case RTKIT_IOREPORT_UNKNOWN1:
+ 	case RTKIT_IOREPORT_UNKNOWN2:
+ 		/* These unknown events have to be acked to make progress. */
+-		error = rtkit_send(state, RTKIT_EP_IOREPORT,
++		error = rtkit_send_reply(state, RTKIT_EP_IOREPORT,
+ 		    RTKIT_MGMT_TYPE(msg->data0), msg->data0);
+ 		if (error)
+ 			return error;
+@@ -707,16 +1432,31 @@ rtkit_handle_oslog_buffer(void *arg)
+ 	struct rtkit *rk = state->rk;
+ 	bus_addr_t addr = state->oslog_addr;
+ 	bus_size_t size = state->oslog_size;
++	int error;
+ 
++	if (addr) {
++		error = rtkit_map_firmware(state, addr, size, &state->oslog);
++		if (error)
++			rtkit_protocol_fault(state, error);
++		return;
++	}
+ 	if (rk) {
+ 		addr = rtkit_alloc(state, size, &state->oslog);
+-		if (addr == (bus_addr_t)-1)
++		if (addr == (bus_addr_t)-1) {
++			rtkit_protocol_fault(state, ENOMEM);
+ 			return;
++		}
++		state->oslog_reply_addr = addr;
++	} else {
++		rtkit_protocol_fault(state, ENXIO);
++		return;
+ 	}
+ 
+-	rtkit_send(state, RTKIT_EP_OSLOG,
++	error = rtkit_send_reply(state, RTKIT_EP_OSLOG,
+ 	    (RTKIT_OSLOG_BUFFER_REQUEST << RTKIT_OSLOG_TYPE_SHIFT),
+ 	    (size << RTKIT_OSLOG_BUFFER_SIZE_SHIFT) | (addr >> PAGE_SHIFT));
++	if (error)
++		rtkit_protocol_fault(state, error);
+ }
+ 
+ int
+@@ -729,16 +1469,35 @@ rtkit_handle_oslog(struct rtkit_state *s
+ 	case RTKIT_OSLOG_BUFFER_REQUEST:
+ 		addr = RTKIT_OSLOG_BUFFER_ADDR(msg->data0) << PAGE_SHIFT;
+ 		size = RTKIT_OSLOG_BUFFER_SIZE(msg->data0);
+-		if (addr)
++		if (state->oslog != NULL) {
++			if (size != state->oslog_size ||
++			    (addr != state->oslog_addr &&
++			    (addr != state->oslog_reply_addr ||
++			    state->oslog_addr != 0)))
++				return EBUSY;
++			if (state->oslog_addr == 0)
++				return rtkit_send_reply(state, RTKIT_EP_OSLOG,
++				    RTKIT_OSLOG_BUFFER_REQUEST << RTKIT_OSLOG_TYPE_SHIFT,
++				    (size << RTKIT_OSLOG_BUFFER_SIZE_SHIFT) |
++				    (state->oslog_reply_addr >> PAGE_SHIFT));
+ 			break;
++		}
+ 
+ 		state->oslog_addr = addr;
+ 		state->oslog_size = size;
+-		if (cold)
+-			rtkit_handle_oslog_buffer(state);
+-		else
+-			task_add(systq, &state->oslog_task);
++		rtkit_handle_oslog_buffer(state);
+ 		break;
++	case RTKIT_OSLOG_LOG:
++		if (!(state->flags & RK_OSLOG_ACK))
++			break;
++		/* Only channel zero and an established buffer are supported. */
++		if (state->oslog == NULL || state->oslog_size == 0 ||
++		    (msg->data0 & RTKIT_OSLOG_LOG_RESERVED)) {
++			printf("%s: invalid oslog counter 0x%016llx\n",
++			    __func__, msg->data0);
++			break;
++		}
++		return rtkit_send_reply(state, RTKIT_EP_OSLOG, 0, msg->data0);
+ 	case RTKIT_OSLOG_UNKNOWN1:
+ 	case RTKIT_OSLOG_UNKNOWN2:
+ 	case RTKIT_OSLOG_UNKNOWN3:
+@@ -751,57 +1510,222 @@ rtkit_handle_oslog(struct rtkit_state *s
+ 
+ 	return 0;
+ }
++/* Messages are immutable once admitted; the doorbell shares the queue lock. */
++static void
++rtkit_request_worker(void *arg)
++{
++	struct rtkit_state *state = arg;
++	struct rtkit_request req;
++	struct aplmbox_msg msg;
++	int error;
+ 
+-int
+-rtkit_poll(struct rtkit_state *state)
++	for (;;) {
++		mtx_enter(&state->request_mtx);
++		if (state->request_count == 0) {
++			state->request_active = 0;
++			mtx_leave(&state->request_mtx);
++			return;
++		}
++		req = state->request_queue[state->request_head];
++		msg = req.msg;
++		state->request_head = (state->request_head + 1) %
++		    RTKIT_REQUEST_QUEUE_CAPACITY;
++		state->request_count--;
++		mtx_leave(&state->request_mtx);
++		error = 0;
++		switch (msg.data1) {
++		case RTKIT_EP_CRASHLOG:
++			if (req.crash_event)
++				rtkit_report_crash(state);
++			else
++				rtkit_handle_crashlog_buffer(state);
++			break;
++		case RTKIT_EP_SYSLOG:
++			error = rtkit_handle_syslog(state, &msg);
++			break;
++		case RTKIT_EP_IOREPORT:
++			error = rtkit_handle_ioreport(state, &msg);
++			break;
++		case RTKIT_EP_OSLOG:
++			error = rtkit_handle_oslog(state, &msg);
++			break;
++		}
++		if (error)
++			rtkit_protocol_fault(state, error);
++	}
++}
++
++static int
++rtkit_queue_request(struct rtkit_state *state, struct aplmbox_msg *msg,
++    int crash_event)
++{
++	u_int index;
++	int error = 0;
++
++	mtx_enter(&state->request_mtx);
++	if (state->request_stopped)
++		error = ESHUTDOWN;
++	else if (state->request_count >= (crash_event ?
++	    RTKIT_REQUEST_QUEUE_CAPACITY : RTKIT_REQUEST_QUEUE_SIZE))
++		error = ENOBUFS;
++	else {
++		index = (state->request_head + state->request_count) %
++		    RTKIT_REQUEST_QUEUE_CAPACITY;
++		state->request_queue[index].msg = *msg;
++		state->request_queue[index].crash_event = crash_event;
++		state->request_count++;
++		if (!state->request_active) {
++			state->request_active = 1;
++			task_add(state->request_taskq, &state->request_task);
++		}
++	}
++	mtx_leave(&state->request_mtx);
++	if (error)
++		rtkit_protocol_fault(state, error);
++	return error;
++}
++
++/* Experimental opt-in: notification echoes can pass older deferred setup.
++ * RX dispatch stays serialized and already queued TX replies remain ordered. */
++static int
++rtkit_try_fast_ack(struct rtkit_state *state, struct aplmbox_msg *msg,
++    int *handled)
++{
++	uint64_t type = RTKIT_MGMT_TYPE(msg->data0);
++	int stopped;
++
++	*handled = 0;
++	if (!(state->flags & RK_FAST_ACK))
++		return 0;
++	if (!((msg->data1 == RTKIT_EP_SYSLOG && type == RTKIT_SYSLOG_LOG &&
++	    !(state->flags & RK_SYSLOG)) ||
++	    (msg->data1 == RTKIT_EP_IOREPORT &&
++	    (type == RTKIT_IOREPORT_UNKNOWN1 || type == RTKIT_IOREPORT_UNKNOWN2))))
++		return 0;
++	mtx_enter(&state->request_mtx);
++	stopped = state->request_stopped;
++	mtx_leave(&state->request_mtx);
++	if (stopped)
++		return 0;
++	*handled = 1;
++	return rtkit_send_reply(state, msg->data1, type, msg->data0);
++}
++
++
++static int
++rtkit_poll_internal(struct rtkit_state *state, int draining)
+ {
+ 	struct mbox_channel *mc = state->mc;
+ 	struct aplmbox_msg msg;
+ 	void (*callback)(void *, uint64_t);
+ 	void *arg;
+ 	uint32_t endpoint;
+-	int error;
++	int error, s, first_crash, crash_event, handled;
++	unsigned int expected = 0, crash_count;
++
++	/* Polling and interrupts must dispatch FIFO messages in the same order. */
++	s = splbio();
++	mtx_enter(&state->request_mtx);
++	if (state->rx_stopped && !draining) {
++		mtx_leave(&state->request_mtx);
++		splx(s);
++		return ESHUTDOWN;
++	}
++	if (!__atomic_compare_exchange_n(&state->rx_active, &expected, 1, 0,
++	    __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
++		if (!state->rx_stopped) {
++			state->rx_timer_used = 1;
++			timeout_add_msec(&state->rx_timeout, 1);
++		}
++		mtx_leave(&state->request_mtx);
++		splx(s);
++		return EWOULDBLOCK;
++	}
++	mtx_leave(&state->request_mtx);
++
++	/* Cold boot may poll without a running timeout thread. */
++	if (cold) {
++		mtx_enter(&state->send_mtx);
++		error = rtkit_retry_replies_locked(state);
++		mtx_leave(&state->send_mtx);
++		if (error) {
++			rtkit_reply_fault(state, error);
++			goto out;
++		}
++	}
+ 
+ 	error = rtkit_recv(mc, &msg);
+ 	if (error)
+-		return error;
++		goto out;
++
++	/* Shared-memory contents precede the firmware's mailbox notification. */
++	membar_consumer();
+ 
+ 	if (state->flags & RK_DEBUG) {
+ 		printf("%s: 0x%016llx 0x%02x\n", __func__,
+ 		    msg.data0, msg.data1);
+ 	}
+ 
++	if (!cold) {
++		error = rtkit_try_fast_ack(state, &msg, &handled);
++		if (error || handled)
++			goto out;
++	}
+ 	endpoint = msg.data1;
+ 	switch (endpoint) {
+ 	case RTKIT_EP_MGMT:
+ 		error = rtkit_handle_mgmt(state, &msg);
+ 		if (error)
+-			return error;
++			goto out;
+ 		break;
+ 	case RTKIT_EP_CRASHLOG:
++		if (RTKIT_MGMT_TYPE(msg.data0) == RTKIT_BUFFER_REQUEST) {
++			crash_count = __atomic_load_n(&state->crash_requests,
++			    __ATOMIC_RELAXED);
++			if (crash_count < 2) {
++				__atomic_store_n(&state->crash_requests,
++				    crash_count + 1, __ATOMIC_RELEASE);
++				/* No RTKit lock is held; notify before slow work. */
++				if (crash_count == 1 && state->rk &&
++				    state->rk->rk_crash_notify)
++					state->rk->rk_crash_notify(state->rk->rk_cookie);
++			}
++		}
++		mtx_enter(&state->crashlog_mtx);
++		first_crash = state->crashlog_state == RTKIT_CRASHLOG_IDLE &&
++		    RTKIT_MGMT_TYPE(msg.data0) == RTKIT_BUFFER_REQUEST;
++		crash_event = (state->crashlog_state == RTKIT_CRASHLOG_PENDING ||
++		    state->crashlog_state == RTKIT_CRASHLOG_READY) &&
++		    RTKIT_MGMT_TYPE(msg.data0) == RTKIT_BUFFER_REQUEST;
++		mtx_leave(&state->crashlog_mtx);
+ 		error = rtkit_handle_crashlog(state, &msg);
++		if (!error && (first_crash || crash_event) && !cold)
++			error = rtkit_queue_request(state, &msg, crash_event);
+ 		if (error)
+-			return error;
++			goto out;
+ 		break;
+ 	case RTKIT_EP_SYSLOG:
+-		error = rtkit_handle_syslog(state, &msg);
++		error = cold ? rtkit_handle_syslog(state, &msg) :
++		    rtkit_queue_request(state, &msg, 0);
+ 		if (error)
+-			return error;
++			goto out;
+ 		break;
+ 	case RTKIT_EP_IOREPORT:
+-		error = rtkit_handle_ioreport(state, &msg);
++		error = cold ? rtkit_handle_ioreport(state, &msg) :
++		    rtkit_queue_request(state, &msg, 0);
+ 		if (error)
+-			return error;
++			goto out;
+ 		break;
+ 	case RTKIT_EP_OSLOG:
+-		error = rtkit_handle_oslog(state, &msg);
++		error = cold ? rtkit_handle_oslog(state, &msg) :
++		    rtkit_queue_request(state, &msg, 0);
+ 		if (error)
+-			return error;
++			goto out;
+ 		break;
+ 	default:
+-		if (endpoint >= 32 && endpoint < 64 && 
+-		    state->callback[endpoint - 32]) {
+-			callback = state->callback[endpoint - 32];
++		if (endpoint >= 32 && endpoint < 64 &&
++		    (callback = __atomic_load_n(&state->callback[endpoint - 32],
++		    __ATOMIC_ACQUIRE)) != NULL) {
+ 			arg = state->arg[endpoint - 32];
+ 			callback(arg, msg.data0);
+ 			break;
+@@ -810,45 +1734,179 @@ rtkit_poll(struct rtkit_state *state)
+ 		printf("%s: unhandled endpoint %d\n", __func__, msg.data1);
+ 		break;
+ 	}
++	if (!error && cold && endpoint != RTKIT_EP_MGMT && endpoint < 32)
++		error = __atomic_load_n(&state->protocol_error, __ATOMIC_ACQUIRE);
++
++out:
++	if (error && error != EWOULDBLOCK && error != ESHUTDOWN)
++		rtkit_protocol_fault(state, error);
++	__atomic_store_n(&state->rx_active, 0, __ATOMIC_RELEASE);
++	wakeup(&state->rx_active);
++	splx(s);
++	return error;
++}
++
++int
++rtkit_poll(struct rtkit_state *state)
++{
++	return rtkit_poll_internal(state, 0);
++}
+ 
++void rtkit_rx_callback(void *);
++
++/* A premature IRQ is retried explicitly after the admission gate opens. */
++static int
++rtkit_resume_rx(struct rtkit_state *state)
++{
++	int error;
++
++	if (!__atomic_load_n(&state->mailbox_paused, __ATOMIC_ACQUIRE))
++		return 0;
++	error = mbox_resume(state->mc);
++	if (error)
++		return error;
++	mtx_enter(&state->request_mtx);
++	state->request_stopped = 0;
++	state->rx_stopped = 0;
++	__atomic_store_n(&state->mailbox_paused, 0, __ATOMIC_RELEASE);
++	mtx_leave(&state->request_mtx);
++	rtkit_rx_callback(state);
+ 	return 0;
+ }
+ 
++/* Process-context callers only.  No buffer is released on failure. */
++static int
++rtkit_pause_rx(struct rtkit_state *state)
++{
++	int error, i;
++
++	if (!__atomic_load_n(&state->mailbox_paused, __ATOMIC_ACQUIRE)) {
++		error = mbox_pause(state->mc, 0);
++		if (error)
++			return error;
++		__atomic_store_n(&state->mailbox_paused, 1, __ATOMIC_RELEASE);
++	}
++	mtx_enter(&state->request_mtx);
++	state->rx_stopped = 1;
++	state->request_stopped = 0;
++	mtx_leave(&state->request_mtx);
++	timeout_del_barrier(&state->rx_timeout);
++	mtx_enter(&state->request_mtx);
++	state->rx_timer_used = 0;
++	mtx_leave(&state->request_mtx);
++	while (__atomic_load_n(&state->rx_active, __ATOMIC_ACQUIRE))
++		(void)tsleep_nsec(&state->rx_active, PWAIT, "rtkrx",
++		    1000000ULL);
++
++	/* Polling remains possible while the IRQ is masked. */
++	for (i = 0; i < RTKIT_REQUEST_QUEUE_SIZE; i++) {
++		error = rtkit_poll_internal(state, 1);
++		if (error)
++			break;
++	}
++	if (i == RTKIT_REQUEST_QUEUE_SIZE)
++		error = EBUSY;
++	else if (error == EWOULDBLOCK)
++		error = 0;
++	mtx_enter(&state->request_mtx);
++	state->request_stopped = 1;
++	mtx_leave(&state->request_mtx);
++	/* Do not remove queued work: accepted requests must run to completion. */
++	taskq_barrier(state->request_taskq);
++	if (!error)
++		error = __atomic_load_n(&state->protocol_error, __ATOMIC_ACQUIRE);
++	return error;
++}
++
+ void
+ rtkit_rx_callback(void *cookie)
+ {
+-	rtkit_poll(cookie);
++	struct rtkit_state *state = cookie;
++
++	int i, error;
++
++	if (__atomic_load_n(&state->mc, __ATOMIC_ACQUIRE) == NULL)
++		return;
++	for (i = 0; i < RTKIT_RX_BUDGET; i++) {
++		error = rtkit_poll(state);
++		if (error)
++			return;
++	}
++	mtx_enter(&state->request_mtx);
++	if (!state->rx_stopped) {
++		state->rx_timer_used = 1;
++		timeout_add_msec(&state->rx_timeout, 1);
++	}
++	mtx_leave(&state->request_mtx);
+ }
+ 
+ struct rtkit_state *
+ rtkit_init(int node, const char *name, int flags, struct rtkit *rk)
+ {
+ 	struct rtkit_state *state;
++	struct mbox_channel *mc;
+ 	struct mbox_client client;
+ 
+-	state = malloc(sizeof(*state), M_DEVBUF, M_WAITOK | M_ZERO);
+-	client.mc_rx_callback = rtkit_rx_callback;
+-	client.mc_rx_arg = state;
+-	if (flags & RK_WAKEUP)
+-		client.mc_flags = MC_WAKEUP;
+-	else
+-		client.mc_flags = 0;
++	if (rk != NULL && ((rk->rk_alloc == NULL) !=
++	    (rk->rk_free == NULL)))
++		return NULL;
+ 
+-	state->mc = mbox_channel(node, name, &client);
+-	if (state->mc == NULL) {
++	state = malloc(sizeof(*state), M_DEVBUF, M_WAITOK | M_ZERO);
++	if (OF_getprop(node, "name", state->node_name,
++	    sizeof(state->node_name) - 1) <= 0)
++		strlcpy(state->node_name, "unknown", sizeof(state->node_name));
++	state->node_phandle = OF_getpropint(node, "phandle", 0);
++	mtx_init(&state->send_mtx, IPL_HIGH);
++	mtx_init(&state->crashlog_mtx, IPL_HIGH);
++	mtx_init(&state->request_mtx, IPL_HIGH);
++	task_set(&state->request_task, rtkit_request_worker, state);
++	state->request_taskq = taskq_create("rtkit", 1, IPL_HIGH,
++	    TASKQ_MPSAFE);
++	if (state->request_taskq == NULL) {
+ 		free(state, M_DEVBUF, sizeof(*state));
+ 		return NULL;
+ 	}
++	timeout_set_flags(&state->rx_timeout, rtkit_rx_callback, state,
++	    KCLOCK_NONE, TIMEOUT_PROC | TIMEOUT_MPSAFE);
++	timeout_set_flags(&state->reply_timeout, rtkit_reply_retry, state,
++	    KCLOCK_NONE, TIMEOUT_PROC | TIMEOUT_MPSAFE);
++	task_set(&state->reply_fault_task, rtkit_reply_fault_task, state);
+ 	state->rk = rk;
+ 	state->flags = flags;
+-
++	/* Match the M1 channel-zero OSLOG acknowledgement policy. */
++	if (OF_is_compatible(OF_peer(0), "apple,t8103"))
++		state->flags |= RK_OSLOG_ACK;
+ 	state->iop_pwrstate = RTKIT_MGMT_PWR_STATE_SLEEP;
+ 	state->ap_pwrstate = RTKIT_MGMT_PWR_STATE_QUIESCED;
+-	
+-	task_set(&state->crashlog_task, rtkit_handle_crashlog_buffer, state);
+-	task_set(&state->syslog_task, rtkit_handle_syslog_buffer, state);
+-	task_set(&state->ioreport_task, rtkit_handle_ioreport_buffer, state);
+-	task_set(&state->oslog_task, rtkit_handle_oslog_buffer, state);
++	client.mc_rx_callback = rtkit_rx_callback;
++	client.mc_rx_arg = state;
++	client.mc_flags = MC_PAUSED;
++	if (flags & RK_WAKEUP)
++		client.mc_flags |= MC_WAKEUP;
++
++	mc = mbox_channel(node, name, &client);
++	if (mc == NULL) {
++		taskq_destroy(state->request_taskq);
++		free(state, M_DEVBUF, sizeof(*state));
++		return NULL;
++	}
++	__atomic_store_n(&state->mc, mc, __ATOMIC_RELEASE);
++	/* The provider keeps HELLO pending until the channel is published. */
++	if (mbox_resume(mc) != 0) {
++		/* Failed resume leaves the claim paused; isolate the caller. */
++		__atomic_store_n(&state->mc, NULL, __ATOMIC_RELEASE);
++		state->rk = NULL;
++		if (mbox_detach(mc) == 0) {
++			taskq_destroy(state->request_taskq);
++			mbox_free(mc);
++			free(state, M_DEVBUF, sizeof(*state));
++		} else {
++			taskq_destroy(state->request_taskq);
++			printf("rtkit: %s: failed to detach paused mailbox\n",
++			    state->node_name);
++		}
++		return NULL;
++	}
+ 
+ 	return state;
+ }
+@@ -856,40 +1914,302 @@ rtkit_init(int node, const char *name, i
+ int
+ rtkit_boot(struct rtkit_state *state)
+ {
+-	int error;
++	int error, was_stopped, was_shutdown;
++
++	if (state->power_unknown)
++		return EIO;
++	error = __atomic_load_n(&state->protocol_error, __ATOMIC_ACQUIRE);
++	if (error)
++		return error;
++	was_stopped = state->reply_stopped;
++
++	mtx_enter(&state->send_mtx);
++	if (!state->reply_stopped && state->reply_error) {
++		error = state->reply_error;
++		mtx_leave(&state->send_mtx);
++		return error;
++	}
++	/* HELLO or EPMAP replies may already be queued at first boot. */
++	if (state->reply_stopped) {
++		state->reply_head = state->reply_count = 0;
++		state->reply_error = state->reply_stopped = 0;
++		__atomic_store_n(&state->reply_fault_reported, 0,
++		    __ATOMIC_RELEASE);
++	}
++	mtx_leave(&state->send_mtx);
++
++	mtx_enter(&state->crashlog_mtx);
++	was_shutdown = state->crashlog_state == RTKIT_CRASHLOG_SHUTDOWN;
++	if (state->crashlog_state == RTKIT_CRASHLOG_SHUTDOWN) {
++		state->crashlog_state = RTKIT_CRASHLOG_IDLE;
++		__atomic_store_n(&state->crash_requests, 0, __ATOMIC_RELEASE);
++	}
++	mtx_leave(&state->crashlog_mtx);
++	/* Pending HELLO must be delivered before sending INIT. */
++	error = rtkit_resume_rx(state);
++	if (error) {
++		mtx_enter(&state->send_mtx);
++		state->reply_stopped = was_stopped;
++		mtx_leave(&state->send_mtx);
++		if (was_shutdown) {
++			mtx_enter(&state->crashlog_mtx);
++			state->crashlog_state = RTKIT_CRASHLOG_SHUTDOWN;
++			mtx_leave(&state->crashlog_mtx);
++		}
++		return error;
++	}
++	error = __atomic_load_n(&state->protocol_error, __ATOMIC_ACQUIRE);
++	if (error)
++		return error;
++	if (state->needs_recovery) {
++		/* A timed-out transition leaves the cached states uncertain. */
++		__atomic_store_n(&state->iop_pwrstate, 0xffff, __ATOMIC_RELEASE);
++		__atomic_store_n(&state->ap_pwrstate, 0xffff, __ATOMIC_RELEASE);
++	}
+ 
+ 	/* Wake up! */
+ 	error = rtkit_set_iop_pwrstate(state, RTKIT_MGMT_PWR_STATE_INIT);
+ 	if (error)
+ 		return error;
+ 
+-	return rtkit_set_ap_pwrstate(state, RTKIT_MGMT_PWR_STATE_ON);
++	error = rtkit_set_ap_pwrstate(state, RTKIT_MGMT_PWR_STATE_ON);
++	if (!error && cold)
++		error = rtkit_flush_replies_cold(state);
++	if (!error)
++		state->needs_recovery = 0;
++	return error;
+ }
+ 
+-void
++/* Wait for the complete firmware endpoint map before starting clients. */
++int
++rtkit_wait_endpoint_map(struct rtkit_state *state, uint64_t timeout_ns)
++{
++	uint64_t now, deadline, polls;
++	int error;
++
++	if (state == NULL || timeout_ns == 0)
++		return EINVAL;
++	error = __atomic_load_n(&state->protocol_error, __ATOMIC_ACQUIRE);
++	if (error)
++		return error;
++	if (cold) {
++		polls = timeout_ns / 10000 + (timeout_ns % 10000 != 0);
++		while (!__atomic_load_n(&state->epmap_complete,
++		    __ATOMIC_ACQUIRE) && polls-- > 0) {
++			error = __atomic_load_n(&state->protocol_error,
++			    __ATOMIC_ACQUIRE);
++			if (error)
++				return error;
++			error = rtkit_poll(state);
++			if (error && error != EWOULDBLOCK)
++				return error;
++			delay(10);
++		}
++		error = __atomic_load_n(&state->protocol_error, __ATOMIC_ACQUIRE);
++		if (error)
++			return error;
++		return __atomic_load_n(&state->epmap_complete,
++		    __ATOMIC_ACQUIRE) ? 0 : ETIMEDOUT;
++	}
++	now = nsecuptime();
++	if (timeout_ns > UINT64_MAX - now)
++		return EINVAL;
++	deadline = now + timeout_ns;
++	while (!__atomic_load_n(&state->epmap_complete, __ATOMIC_ACQUIRE)) {
++		sleep_setup(&state->epmap_complete, PWAIT, "rtkmap");
++		error = __atomic_load_n(&state->protocol_error, __ATOMIC_ACQUIRE);
++		if (error) {
++			(void)sleep_finish(INFSLP, 0);
++			return error;
++		}
++		now = nsecuptime();
++		if (now >= deadline) {
++			(void)sleep_finish(INFSLP, 0);
++			return __atomic_load_n(&state->epmap_complete,
++			    __ATOMIC_ACQUIRE) ? 0 : ETIMEDOUT;
++		}
++		error = sleep_finish(deadline - now,
++		    !__atomic_load_n(&state->epmap_complete, __ATOMIC_ACQUIRE) &&
++		    !__atomic_load_n(&state->protocol_error, __ATOMIC_ACQUIRE));
++		if (__atomic_load_n(&state->protocol_error, __ATOMIC_ACQUIRE))
++			return __atomic_load_n(&state->protocol_error,
++			    __ATOMIC_ACQUIRE);
++		if (error && !__atomic_load_n(&state->epmap_complete,
++		    __ATOMIC_ACQUIRE))
++			return error;
++	}
++	return __atomic_load_n(&state->protocol_error, __ATOMIC_ACQUIRE);
++}
++
++/* At elevated IPL we can only stop an already acknowledged, idle instance. */
++static int
++rtkit_shutdown_nosleep(struct rtkit_state *state)
++{
++	int error, i;
++
++	if (state->power_unknown ||
++	    __atomic_load_n(&state->power_ack_seen, __ATOMIC_ACQUIRE) != 3 ||
++	    __atomic_load_n(&state->ap_pwrstate, __ATOMIC_ACQUIRE) !=
++	    RTKIT_MGMT_PWR_STATE_QUIESCED ||
++	    __atomic_load_n(&state->iop_pwrstate, __ATOMIC_ACQUIRE) !=
++	    RTKIT_MGMT_PWR_STATE_SLEEP ||
++	    __atomic_load_n(&state->reply_fault_reported, __ATOMIC_ACQUIRE))
++		return EBUSY;
++	mtx_enter(&state->request_mtx);
++	mtx_enter(&state->send_mtx);
++	if (state->rx_stopped || state->rx_active || state->request_active ||
++	    state->request_count || state->rx_timer_used ||
++	    state->reply_timer_used || state->reply_count || state->reply_error ||
++	    state->ndmamem || state->crashlog != NULL || state->syslog_msg != NULL) {
++		mtx_leave(&state->send_mtx);
++		mtx_leave(&state->request_mtx);
++		return EBUSY;
++	}
++	state->rx_stopped = 1;
++	mtx_leave(&state->send_mtx);
++	mtx_leave(&state->request_mtx);
++	error = mbox_pause(state->mc, MBOX_PAUSE_NOSLEEP);
++	if (error) {
++		mtx_enter(&state->request_mtx);
++		state->rx_stopped = 0;
++		mtx_leave(&state->request_mtx);
++		return error;
++	}
++	__atomic_store_n(&state->mailbox_paused, 1, __ATOMIC_RELEASE);
++	state->needs_recovery = 1;
++	for (i = 0; i < RTKIT_REQUEST_QUEUE_SIZE; i++) {
++		error = rtkit_poll_internal(state, 1);
++		if (error)
++			break;
++	}
++	if (i == RTKIT_REQUEST_QUEUE_SIZE)
++		return EBUSY;
++	if (error != EWOULDBLOCK)
++		return error;
++	mtx_enter(&state->request_mtx);
++	mtx_enter(&state->send_mtx);
++	error = state->request_active || state->request_count ||
++	    state->reply_count || state->reply_error || state->reply_timer_used ||
++	    state->ndmamem || state->crashlog != NULL || state->syslog_msg != NULL ||
++	    __atomic_load_n(&state->protocol_error, __ATOMIC_ACQUIRE) ||
++	    __atomic_load_n(&state->iop_pwrstate, __ATOMIC_ACQUIRE) !=
++	    RTKIT_MGMT_PWR_STATE_SLEEP ||
++	    __atomic_load_n(&state->ap_pwrstate, __ATOMIC_ACQUIRE) !=
++	    RTKIT_MGMT_PWR_STATE_QUIESCED ? EBUSY : 0;
++	if (!error) {
++		state->request_stopped = 1;
++		state->reply_stopped = 1;
++	}
++	mtx_leave(&state->send_mtx);
++	mtx_leave(&state->request_mtx);
++	if (error)
++		return error;
++	mtx_enter(&state->crashlog_mtx);
++	state->crashlog_state = RTKIT_CRASHLOG_SHUTDOWN;
++	mtx_leave(&state->crashlog_mtx);
++	__atomic_store_n(&state->epmap, 0, __ATOMIC_RELEASE);
++	__atomic_store_n(&state->epmap_complete, 0, __ATOMIC_RELEASE);
++	return 0;
++}
++
++int
+ rtkit_shutdown(struct rtkit_state *state)
+ {
+ 	struct rtkit *rk = state->rk;
+-	int i;
++	int i, error, retained = 0, unmap_error = 0;
++	char *crashlog;
++	bus_size_t crashlog_size;
++	int external_map;
++	if (state->power_unknown)
++		return EIO;
++
++	if (cold || curcpu()->ci_cpl != IPL_NONE || curcpu()->ci_idepth != 0)
++		return rtkit_shutdown_nosleep(state);
++	state->needs_recovery = 1;
++
++	error = rtkit_set_ap_pwrstate(state, RTKIT_MGMT_PWR_STATE_QUIESCED);
++	if (error)
++		return error;
++	error = rtkit_set_iop_pwrstate(state, RTKIT_MGMT_PWR_STATE_SLEEP);
++	if (error)
++		return error;
+ 
+-	rtkit_set_ap_pwrstate(state, RTKIT_MGMT_PWR_STATE_QUIESCED);
+-	rtkit_set_iop_pwrstate(state, RTKIT_MGMT_PWR_STATE_SLEEP);
++	KASSERT(__atomic_load_n(&state->iop_pwrstate, __ATOMIC_ACQUIRE) ==
++	    RTKIT_MGMT_PWR_STATE_SLEEP);
++	KASSERT(__atomic_load_n(&state->ap_pwrstate, __ATOMIC_ACQUIRE) ==
++	    RTKIT_MGMT_PWR_STATE_QUIESCED);
++	error = rtkit_pause_rx(state);
++	if (error)
++		return error;
+ 
+-	KASSERT(state->iop_pwrstate == RTKIT_MGMT_PWR_STATE_SLEEP);
+-	KASSERT(state->ap_pwrstate == RTKIT_MGMT_PWR_STATE_QUIESCED);
+-	state->epmap = 0;
+ 
++	/* Quiesced firmware must not have unsent replies. */
++	mtx_enter(&state->send_mtx);
++	error = state->reply_error ? state->reply_error :
++	    (state->reply_count ? EBUSY : 0);
++	if (!error)
++		state->reply_stopped = 1;
++	mtx_leave(&state->send_mtx);
++	if (error)
++		return error;
++	timeout_del_barrier(&state->reply_timeout);
++	mtx_enter(&state->send_mtx);
++	state->reply_timer_used = 0;
++	mtx_leave(&state->send_mtx);
++	taskq_del_barrier(systqmp, &state->reply_fault_task);
++	__atomic_store_n(&state->epmap, 0, __ATOMIC_RELEASE);
++	__atomic_store_n(&state->epmap_complete, 0, __ATOMIC_RELEASE);
++
++	mtx_enter(&state->crashlog_mtx);
++	state->crashlog_state = RTKIT_CRASHLOG_SHUTDOWN;
++	mtx_leave(&state->crashlog_mtx);
++	/* rtkit_pause_rx drained producers and the ordered worker. */
++	mtx_enter(&state->crashlog_mtx);
++	crashlog = state->crashlog;
++	crashlog_size = state->crashlog_size;
++	external_map = state->crashlog_external_map;
+ 	state->crashlog = NULL;
++	state->crashlog_external_map = 0;
++	mtx_leave(&state->crashlog_mtx);
++	if (external_map && crashlog != NULL) {
++		pmap_kremove((vaddr_t)crashlog, crashlog_size * PAGE_SIZE);
++		pmap_update(pmap_kernel());
++		km_free(crashlog, crashlog_size * PAGE_SIZE, &kv_any, &kp_none);
++	}
+ 	state->ioreport = NULL;
+ 	state->oslog = NULL;
+-	state->syslog = NULL;
++	__atomic_store_n(&state->syslog, NULL, __ATOMIC_RELEASE);
++	if (state->syslog_msg != NULL) {
++		free(state->syslog_msg, M_DEVBUF, state->syslog_msg_size);
++		state->syslog_msg = NULL;
++	}
+ 
+ 	/* Clean up our memory allocations. */
+ 	for (i = 0; i < state->ndmamem; i++) {
++		if (state->dmamem[i].rdm_external == 2) {
++			pmap_kremove((vaddr_t)state->dmamem[i].rdm_kva,
++			    state->dmamem[i].rdm_size);
++			pmap_update(pmap_kernel());
++			km_free(state->dmamem[i].rdm_kva,
++			    state->dmamem[i].rdm_size, &kv_any, &kp_none);
++			continue;
++		}
++		if (state->dmamem[i].rdm_external == 1) {
++			rk->rk_free(rk->rk_cookie, state->dmamem[i].rdm_cookie);
++			continue;
++		}
+ 		if (rk->rk_unmap) {
+-			rk->rk_unmap(rk->rk_cookie,
++			error = rk->rk_unmap(rk->rk_cookie,
+ 			    state->dmamem[i].rdm_seg.ds_addr,
+ 			    state->dmamem[i].rdm_seg.ds_len);
++			if (error) {
++				if (unmap_error == 0)
++					unmap_error = error;
++				if (retained != i)
++					state->dmamem[retained] = state->dmamem[i];
++				retained++;
++				continue;
++			}
+ 		}
+ 		bus_dmamap_unload(rk->rk_dmat, state->dmamem[i].rdm_map);
+ 		bus_dmamap_destroy(rk->rk_dmat, state->dmamem[i].rdm_map);
+@@ -897,98 +2217,158 @@ rtkit_shutdown(struct rtkit_state *state
+ 		    state->dmamem[i].rdm_size);
+ 		bus_dmamem_free(rk->rk_dmat, &state->dmamem[i].rdm_seg, 1);
+ 	}
+-	state->ndmamem = 0;
++	state->ndmamem = retained;
++	return unmap_error;
+ }
+ 
+-int
+-rtkit_set_ap_pwrstate(struct rtkit_state *state, uint16_t pwrstate)
++/* The interrupt may acknowledge before the waiter has prepared to sleep. */
++static int
++rtkit_wait_pwrstate(struct rtkit_state *state, uint16_t *current,
++    uint16_t desired, const char *wmesg)
+ {
++	uint64_t deadline, now;
+ 	int error, timo;
+ 
+-	if (state->ap_pwrstate == pwrstate)
+-		return 0;
+-
+-	error = rtkit_send(state, RTKIT_EP_MGMT, RTKIT_MGMT_AP_PWR_STATE,
+-	    pwrstate);
+-	if (error)
+-		return error;
+-
+ 	if (cold) {
+ 		for (timo = 0; timo < 100000; timo++) {
+-			error = rtkit_poll(state);
+-			if (error == EWOULDBLOCK) {
+-				delay(10);
+-				continue;
+-			}
++			error = __atomic_load_n(&state->protocol_error,
++			    __ATOMIC_ACQUIRE);
+ 			if (error)
+ 				return error;
+-
+-			if (state->ap_pwrstate == pwrstate)
++			if (__atomic_load_n(current, __ATOMIC_ACQUIRE) == desired)
+ 				return 0;
++			error = rtkit_poll(state);
++			if (error && error != EWOULDBLOCK)
++				return error;
++			if (error == EWOULDBLOCK)
++				delay(10);
+ 		}
++		return __atomic_load_n(current, __ATOMIC_ACQUIRE) == desired ?
++		    0 : ETIMEDOUT;
+ 	}
+ 
+-	while (state->ap_pwrstate != pwrstate) {
+-		error = tsleep_nsec(&state->ap_pwrstate, PWAIT, "appwr",
+-		    SEC_TO_NSEC(1));
+-		if (error)
++	deadline = nsecuptime() + SEC_TO_NSEC(1);
++	for (;;) {
++		sleep_setup(current, PWAIT, wmesg);
++		error = __atomic_load_n(&state->protocol_error, __ATOMIC_ACQUIRE);
++		if (error) {
++			(void)sleep_finish(INFSLP, 0);
++			return error;
++		}
++		now = nsecuptime();
++		if (__atomic_load_n(current, __ATOMIC_ACQUIRE) == desired) {
++			(void)sleep_finish(INFSLP, 0);
++			return 0;
++		}
++		if (now >= deadline) {
++			(void)sleep_finish(INFSLP, 0);
++			return ETIMEDOUT;
++		}
++		error = sleep_finish(deadline - now,
++		    !__atomic_load_n(&state->protocol_error, __ATOMIC_ACQUIRE));
++		if (__atomic_load_n(&state->protocol_error, __ATOMIC_ACQUIRE))
++			return __atomic_load_n(&state->protocol_error,
++			    __ATOMIC_ACQUIRE);
++		if (error && __atomic_load_n(current, __ATOMIC_ACQUIRE) != desired)
+ 			return error;
+ 	}
+-
+-	return 0;
+ }
+ 
+ int
+-rtkit_set_iop_pwrstate(struct rtkit_state *state, uint16_t pwrstate)
++rtkit_set_ap_pwrstate(struct rtkit_state *state, uint16_t pwrstate)
+ {
+-	int error, timo;
++	int error;
+ 
+-	if (state->iop_pwrstate == (pwrstate & 0xff))
+-		return 0;
++	if (state->power_unknown)
++		return EIO;
+ 
+-	error = rtkit_send(state, RTKIT_EP_MGMT, RTKIT_MGMT_IOP_PWR_STATE,
+-	    pwrstate);
+-	if (error)
++	if (__atomic_load_n(&state->ap_pwrstate, __ATOMIC_ACQUIRE) == pwrstate) {
++		if (__atomic_load_n(&state->power_ack_seen, __ATOMIC_ACQUIRE) & 2)
++			return 0;
++		__atomic_store_n(&state->ap_pwrstate, 0xffff, __ATOMIC_RELEASE);
++	}
++
++	error = rtkit_send_wait(state, RTKIT_EP_MGMT,
++	    RTKIT_MGMT_AP_PWR_STATE, pwrstate);
++	if (error) {
++		if (error != EBUSY)
++			state->power_unknown = 1;
+ 		return error;
++	}
+ 
+-	if (cold) {
+-		for (timo = 0; timo < 100000; timo++) {
+-			error = rtkit_poll(state);
+-			if (error == EWOULDBLOCK) {
+-				delay(10);
+-				continue;
+-			}
+-			if (error)
+-				return error;
++	error = rtkit_wait_pwrstate(state, &state->ap_pwrstate, pwrstate,
++	    "appwr");
++	if (error)
++		state->power_unknown = 1;
++	return error;
++}
+ 
+-			if (state->iop_pwrstate == (pwrstate & 0xff))
+-				return 0;
+-		}
++int
++rtkit_set_iop_pwrstate(struct rtkit_state *state, uint16_t pwrstate)
++{
++	int error;
++
++	if (state->power_unknown)
++		return EIO;
++
++	if (__atomic_load_n(&state->iop_pwrstate, __ATOMIC_ACQUIRE) ==
++	    (pwrstate & 0xff)) {
++		if (__atomic_load_n(&state->power_ack_seen, __ATOMIC_ACQUIRE) & 1)
++			return 0;
++		__atomic_store_n(&state->iop_pwrstate, 0xffff, __ATOMIC_RELEASE);
+ 	}
+ 
+-	while (state->iop_pwrstate != (pwrstate & 0xff)) {
+-		error = tsleep_nsec(&state->iop_pwrstate, PWAIT, "ioppwr",
+-		    SEC_TO_NSEC(1));
+-		if (error)
+-			return error;
++	error = rtkit_send_wait(state, RTKIT_EP_MGMT,
++	    RTKIT_MGMT_IOP_PWR_STATE, pwrstate);
++	if (error) {
++		if (error != EBUSY)
++			state->power_unknown = 1;
++		return error;
+ 	}
+ 
+-	return 0;
++	error = rtkit_wait_pwrstate(state, &state->iop_pwrstate,
++	    pwrstate & 0xff, "ioppwr");
++	if (error)
++		state->power_unknown = 1;
++	return error;
+ }
+ 
+-int
+-rtkit_start_endpoint(struct rtkit_state *state, uint32_t endpoint,
+-    void (*callback)(void *, uint64_t), void *arg)
++static int
++rtkit_start_endpoint_common(struct rtkit_state *state, uint32_t endpoint,
++    void (*callback)(void *, uint64_t), void *arg, int wait)
+ {
++	uint64_t reply;
++
+ 	if (endpoint < 32 || endpoint >= 64)
+ 		return EINVAL;
+ 
+-	if ((state->epmap & (1ULL << endpoint)) == 0)
++	if ((__atomic_load_n(&state->epmap, __ATOMIC_ACQUIRE) &
++	    (1ULL << endpoint)) == 0)
+ 		return EINVAL;
+ 
+-	state->callback[endpoint - 32] = callback;
+ 	state->arg[endpoint - 32] = arg;
+-	return rtkit_start(state, endpoint);
++	__atomic_store_n(&state->callback[endpoint - 32], callback,
++	    __ATOMIC_RELEASE);
++	if (!wait)
++		return rtkit_start(state, endpoint);
++	reply = ((uint64_t)endpoint << RTKIT_MGMT_STARTEP_EP_SHIFT) |
++	    RTKIT_MGMT_STARTEP_START;
++	return rtkit_send_wait(state, RTKIT_EP_MGMT, RTKIT_MGMT_STARTEP,
++	    reply);
++}
++
++int
++rtkit_start_endpoint(struct rtkit_state *state, uint32_t endpoint,
++    void (*callback)(void *, uint64_t), void *arg)
++{
++	return rtkit_start_endpoint_common(state, endpoint, callback, arg, 0);
++}
++
++int
++rtkit_start_endpoint_wait(struct rtkit_state *state, uint32_t endpoint,
++    void (*callback)(void *, uint64_t), void *arg)
++{
++	return rtkit_start_endpoint_common(state, endpoint, callback, arg, 1);
+ }
+ 
+ int
+@@ -996,4 +2376,47 @@ rtkit_send_endpoint(struct rtkit_state *
+     uint64_t data)
+ {
+ 	return rtkit_send(state, endpoint, 0, data);
++}
++
++int
++rtkit_send_endpoint_wait(struct rtkit_state *state, uint32_t endpoint,
++    uint64_t data)
++{
++	return rtkit_send_wait(state, endpoint, 0, data);
++}
++
++int
++rtkit_detach_callbacks(struct rtkit_state *state)
++{
++	int error, was_stopped;
++
++	if (state == NULL || state->mc == NULL)
++		return EINVAL;
++	if (cold || curcpu()->ci_cpl != IPL_NONE || curcpu()->ci_idepth != 0)
++		return EBUSY;
++	error = rtkit_pause_rx(state);
++	if (error)
++		return error;
++	mtx_enter(&state->send_mtx);
++	error = state->reply_error ? state->reply_error :
++	    (state->reply_count ? EBUSY : 0);
++	was_stopped = state->reply_stopped;
++	if (!error)
++		state->reply_stopped = 1;
++	mtx_leave(&state->send_mtx);
++	if (error)
++		return error;
++	timeout_del_barrier(&state->reply_timeout);
++	taskq_del_barrier(systqmp, &state->reply_fault_task);
++	error = mbox_detach(state->mc);
++	if (error) {
++		mtx_enter(&state->send_mtx);
++		state->reply_stopped = was_stopped;
++		mtx_leave(&state->send_mtx);
++		return error;
++	}
++	taskq_destroy(state->request_taskq);
++	mbox_free(state->mc);
++	state->mc = NULL;
++	return 0;
+ }
+Index: sys/arch/arm64/dev/rtkit.h
+===================================================================
+RCS file: /cvs/src/sys/arch/arm64/dev/rtkit.h,v
+diff -u -p -r1.10 rtkit.h
+--- sys/arch/arm64/dev/rtkit.h	30 Dec 2023 13:13:11 -0000	1.10
++++ sys/arch/arm64/dev/rtkit.h	20 Nov 2026 16:50:44 -0000
+@@ -11,23 +11,66 @@ struct rtkit {
+ 	void *rk_cookie;
+ 	bus_dma_tag_t rk_dmat;
+ 	int (*rk_map)(void *, bus_addr_t, bus_size_t);
++	/* rk_map may be called at elevated IPL only with this guarantee. */
++	int rk_map_nosleep;
+ 	int (*rk_unmap)(void *, bus_addr_t, bus_size_t);
+-	paddr_t (*rk_logmap)(void *, bus_addr_t);
++	/* Validate the complete range and return a physical address with its
++	 * device/cache attributes, or (paddr_t)-1.  Firmware owns the memory. */
++	paddr_t (*rk_logmap)(void *, bus_addr_t, bus_size_t);
++	/* Opt in only if rk_logmap cannot sleep or allocate. */
++	int rk_logmap_nosleep;
++	/*
++	 * Optional firmware-addressed, coherent shared memory.  The allocator
++	 * returns a 44-bit GPU address or its canonical high-half form, a CPU
++	 * mapping and a non-NULL opaque handle.  The mapping remains valid until
++	 * free; failed allocations must be rolled back by the allocator.  RTKit
++	 * transmits only the low 44 bits.  Both hooks must be supplied together.
++	 * Hooks run in task context and may sleep; never called at cold IPL.
++	 */
++	int (*rk_alloc)(void *, bus_size_t, caddr_t *, bus_addr_t *, void **);
++	void (*rk_free)(void *, void *);
++	/* IRQ/cold-poll context, once per crash; must not sleep. */
++	void (*rk_crash_notify)(void *);
++	/*
++	 * Ordered worker or cold-poll context, at most once per crash.  The
++	 * snapshot is valid only during the call and is NULL when unavailable.
++	 */
++	void (*rk_crashed)(void *, const void *, bus_size_t);
++	/* Process context; reports a permanent transport or protocol fault. */
++	void (*rk_fault)(void *, int);
+ };
+ 
+ #define RK_WAKEUP	0x00000001
+ #define RK_DEBUG	0x00000002
+ #define RK_SYSLOG	0x00000004
++/* Experimental: notification echoes may overtake deferred endpoint work. */
++#define RK_FAST_ACK	0x00000008
++/* Echo valid channel-zero OSLOG counters after the buffer is ready. */
++#define RK_OSLOG_ACK	0x00000010
+ 
+ struct rtkit_state *rtkit_init(int, const char *, int, struct rtkit *);
+ int	rtkit_boot(struct rtkit_state *);
+-void	rtkit_shutdown(struct rtkit_state *);
++int	rtkit_wait_endpoint_map(struct rtkit_state *, uint64_t);
++/* Failure preserves firmware-visible memory.  EIO on boot after an uncertain
++ * power acknowledgement requires an actual firmware reset, not a retry. */
++int	rtkit_shutdown(struct rtkit_state *);
++/* Process context, serialized against boot, poll, send and shutdown.  Detach
++ * stops callbacks but does not stop firmware or release its DMA mappings. */
++int	rtkit_detach_callbacks(struct rtkit_state *);
+ int	rtkit_set_ap_pwrstate(struct rtkit_state *, uint16_t);
+ int	rtkit_set_iop_pwrstate(struct rtkit_state *, uint16_t);
++/* Serializes receive dispatch; a concurrent or reentrant poll returns
++ * EWOULDBLOCK without consuming a message.  Paused reception returns
++ * ESHUTDOWN.  IRQ delivery schedules bounded continuation as needed. */
+ int	rtkit_poll(struct rtkit_state *);
+ int	rtkit_start_endpoint(struct rtkit_state *, uint32_t,
+ 	    void (*)(void *, uint64_t), void *);
++/* A nonzero result means the endpoint message was not sent or queued. */
+ int	rtkit_send_endpoint(struct rtkit_state *, uint32_t, uint64_t);
++/* Process context only; EBUSY after a bounded full-FIFO wait. */
++int	rtkit_start_endpoint_wait(struct rtkit_state *, uint32_t,
++	    void (*)(void *, uint64_t), void *);
++int	rtkit_send_endpoint_wait(struct rtkit_state *, uint32_t, uint64_t);
+ 
+ int	aplrtk_start(uint32_t);
+ int	aplsart_map(uint32_t, bus_addr_t, bus_size_t);
+Index: sys/arch/arm64/include/bus.h
+===================================================================
+RCS file: /cvs/src/sys/arch/arm64/include/bus.h,v
+diff -u -p -r1.13 bus.h
+--- sys/arch/arm64/include/bus.h	22 Jun 2026 07:54:19 -0000	1.13
++++ sys/arch/arm64/include/bus.h	20 Nov 2026 16:50:44 -0000
+@@ -338,6 +338,7 @@ bus_space_barrier(bus_space_tag_t t, bus
+ #define	BUS_DMA_NOCACHE		0x1000
+ #define	BUS_DMA_64BIT		0x2000	/* device handles 64bit dva */
+ #define	BUS_DMA_FIXED		0x4000	/* place mapping at specified dva */
++#define	BUS_DMA_NOBOUNCE	0x8000	/* fail rather than use bounce pages */
+ 
+ /* Forwards needed by prototypes below. */
+ struct mbuf;
+@@ -419,6 +420,10 @@ struct bus_dma_tag {
+ 	 * internal memory address translation information.
+ 	 */
+ 	bus_addr_t _dma_mask;
++	/* Mapping create/load/unload/destroy do not copy to or from the
++	 * original pages, and zero _dm_nused proves that no bounce occurred.
++	 * A wrapper must prove this recursively for its parent as well. */
++	int (*_dmamap_nobounce_safe)(bus_dma_tag_t);
+ };
+ 
+ #define	bus_dmamap_create(t, s, n, m, b, f, p)			\

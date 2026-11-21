@@ -1,0 +1,361 @@
+Index: sys/sys/file.h
+===================================================================
+RCS file: /cvs/src/sys/sys/file.h,v
+diff -u -p -r1.67 file.h
+--- sys/sys/file.h	19 Sep 2026 17:21:52 -0000	1.67
++++ sys/sys/file.h	20 Nov 2026 16:50:42 -0000
+@@ -55,6 +55,7 @@ struct knote;
+ struct stat;
+ struct file;
+ struct ucred;
++struct uvm_object;
+ 
+ /**
+  * File operations.
+@@ -71,6 +72,9 @@ struct	fileops {
+ 	int	(*fo_stat)(struct file *, struct stat *, struct proc *);
+ 	int	(*fo_close)(struct file *, struct proc *);
+ 	int	(*fo_seek)(struct file *, off_t *, int, struct proc *);
++	/* Returns a referenced object and may reduce the supplied maximum. */
++	int	(*fo_mmap)(struct file *, off_t, size_t, int, int *,
++	    struct uvm_object **);
+ };
+ #define FO_POSITION	0x00000001	/* positioned read/write */
+ 
+Index: sys/sys/rwlock.h
+===================================================================
+RCS file: /cvs/src/sys/sys/rwlock.h,v
+diff -u -p -r1.34 rwlock.h
+--- sys/sys/rwlock.h	21 Jul 2025 20:36:41 -0000	1.34
++++ sys/sys/rwlock.h	20 Nov 2026 16:50:42 -0000
+@@ -230,15 +230,21 @@ int	rrw_status(struct rrwlock *);
+ 	static struct lock_type __lock_type = { .lt_name = #rwl };	\
+ 	_rw_obj_alloc_flags(rwl, name, flags, &__lock_type);		\
+ } while (0)
++#define rw_obj_tryalloc(rwl, name) ({					\
++	static struct lock_type __lock_type = { .lt_name = #rwl };	\
++	_rw_obj_tryalloc(rwl, name, &__lock_type);			\
++})
+ #else
+ #define rw_obj_alloc_flags(rwl, name, flags) \
+ 			_rw_obj_alloc_flags(rwl, name, flags, NULL)
++#define rw_obj_tryalloc(rwl, name) _rw_obj_tryalloc(rwl, name, NULL)
+ #endif
+ #define rw_obj_alloc(rwl, name)		rw_obj_alloc_flags(rwl, name, 0)
+ 
+ void	rw_obj_init(void);
+ void	_rw_obj_alloc_flags(struct rwlock **, const char *, int,
+ 		struct lock_type *);
++int	_rw_obj_tryalloc(struct rwlock **, const char *, struct lock_type *);
+ void	rw_obj_hold(struct rwlock *);
+ int	rw_obj_free(struct rwlock *);
+ 
+Index: sys/kern/kern_rwlock.c
+===================================================================
+RCS file: /cvs/src/sys/kern/kern_rwlock.c,v
+diff -u -p -r1.58 kern_rwlock.c
+--- sys/kern/kern_rwlock.c	21 Jul 2025 20:36:41 -0000	1.58
++++ sys/kern/kern_rwlock.c	20 Nov 2026 16:50:42 -0000
+@@ -718,6 +718,22 @@ _rw_obj_alloc_flags(struct rwlock **lock
+ 	*lock = &mo->ro_lock;
+ }
+ 
++int
++_rw_obj_tryalloc(struct rwlock **lock, const char *name,
++    struct lock_type *type)
++{
++	struct rwlock_obj *mo;
++
++	mo = pool_get(&rwlock_obj_pool, PR_NOWAIT);
++	if (mo == NULL)
++		return 0;
++	mo->ro_magic = RWLOCK_OBJ_MAGIC;
++	_rw_init_flags(&mo->ro_lock, name, 0, type, 0);
++	mo->ro_refcnt = 1;
++	*lock = &mo->ro_lock;
++	return 1;
++}
++
+ /*
+  * rw_obj_hold:
+  *
+Index: sys/uvm/uvm_aobj.c
+===================================================================
+RCS file: /cvs/src/sys/uvm/uvm_aobj.c,v
+diff -u -p -r1.123 uvm_aobj.c
+--- sys/uvm/uvm_aobj.c	6 Sep 2026 21:01:30 -0000	1.123
++++ sys/uvm/uvm_aobj.c	20 Nov 2026 16:50:42 -0000
+@@ -687,7 +687,10 @@ uao_create(vsize_t size, int flags)
+ 		aobj = &kernel_object_store;
+ 		kobj_alloced = UAO_FLAG_KERNSWAP;
+ 	} else {
+-		aobj = pool_get(&uvm_aobj_pool, PR_WAITOK);
++		aobj = pool_get(&uvm_aobj_pool,
++		    (flags & UAO_FLAG_CANFAIL) ? PR_NOWAIT : PR_WAITOK);
++		if (aobj == NULL)
++			return NULL;
+ 		aobj->u_pages = pages;
+ 		aobj->u_flags = 0;
+ 		refs = 1;
+@@ -737,7 +740,19 @@ uao_create(vsize_t size, int flags)
+ 	/*
+ 	 * Initialise UVM object.
+ 	 */
+-	uvm_obj_init(&aobj->u_obj, &aobj_pager, refs);
++	if (flags & UAO_FLAG_CANFAIL) {
++		if (!uvm_obj_init_try(&aobj->u_obj, &aobj_pager, refs)) {
++			if (UAO_USES_SWHASH(aobj))
++				hashfree(aobj->u_swhash,
++				    UAO_SWHASH_BUCKETS(pages), M_UVMAOBJ);
++			else
++				free(aobj->u_swslots, M_UVMAOBJ,
++				    pages * sizeof(int));
++			pool_put(&uvm_aobj_pool, aobj);
++			return NULL;
++		}
++	} else
++		uvm_obj_init(&aobj->u_obj, &aobj_pager, refs);
+ 	if (flags & UAO_FLAG_KERNOBJ) {
+ 		/* Use a temporary static lock for kernel_object. */
+ 		rw_init(&bootstrap_kernel_object_lock, "kobjlk");
+Index: sys/uvm/uvm_aobj.h
+===================================================================
+RCS file: /cvs/src/sys/uvm/uvm_aobj.h,v
+diff -u -p -r1.20 uvm_aobj.h
+--- sys/uvm/uvm_aobj.h	13 May 2023 09:24:59 -0000	1.20
++++ sys/uvm/uvm_aobj.h	20 Nov 2026 16:50:42 -0000
+@@ -47,7 +47,7 @@
+ /* flags for uao_create: can only be used one time (at bootup) */
+ #define UAO_FLAG_KERNOBJ	0x1	/* create kernel object */
+ #define UAO_FLAG_KERNSWAP	0x2	/* enable kernel swap */
+-#define UAO_FLAG_CANFAIL	0x4	/* creation can fail */
++#define UAO_FLAG_CANFAIL	0x4	/* nonblocking creation can fail */
+ 
+ /* internal flags */
+ #define UAO_FLAG_NOSWAP		0x8	/* aobj can't swap (kernel obj only!) */
+Index: sys/uvm/uvm_device.h
+===================================================================
+RCS file: /cvs/src/sys/uvm/uvm_device.h,v
+diff -u -p -r1.11 uvm_device.h
+--- sys/uvm/uvm_device.h	11 Jul 2014 16:35:40 -0000	1.11
++++ sys/uvm/uvm_device.h	20 Nov 2026 16:50:42 -0000
+@@ -63,8 +63,11 @@ struct uvm_device {
+  * prototypes
+  */
+ 
+-struct uvm_object *udv_attach(dev_t, vm_prot_t, voff_t, vsize_t);
+-struct uvm_object *udv_attach_drm(dev_t, vm_prot_t, voff_t, vsize_t);
++struct uvm_object *udv_attach(dev_t, vm_prot_t, vm_prot_t, voff_t,
++    vsize_t, vm_prot_t *, int *);
++struct uvm_object *udv_attach_drm(dev_t, vm_prot_t, vm_prot_t, voff_t,
++    vsize_t, vm_prot_t *, int *);
++int drm_reject_private_mmap(dev_t, off_t, vsize_t);
+ 
+ #endif /* _KERNEL */
+ 
+Index: sys/uvm/uvm_mmap.c
+===================================================================
+RCS file: /cvs/src/sys/uvm/uvm_mmap.c,v
+diff -u -p -r1.204 uvm_mmap.c
+--- sys/uvm/uvm_mmap.c	11 Feb 2026 22:34:41 -0000	1.204
++++ sys/uvm/uvm_mmap.c	20 Nov 2026 16:50:43 -0000
+@@ -84,6 +84,9 @@ int uvm_mmapanon(vm_map_t, vaddr_t *, vs
+     vsize_t, struct proc *);
+ int uvm_mmapfile(vm_map_t, vaddr_t *, vsize_t, vm_prot_t, vm_prot_t, int,
+     struct vnode *, voff_t, vsize_t, struct proc *);
++int uvm_mmapobject(vm_map_t, vaddr_t *, vsize_t, vm_prot_t, int,
++    struct file *, voff_t, vsize_t);
++#include "drm.h"
+ 
+ 
+ /*
+@@ -295,6 +298,23 @@ sys_mmap(struct proc *p, void *v, regist
+ 			goto out;
+ 		}
+ 
++		if (fp->f_type != DTYPE_VNODE && fp->f_ops->fo_mmap != NULL) {
++			if ((flags & MAP_PRIVATE) || (flags & __MAP_NOFAULT)) {
++				error = EINVAL;
++				goto out;
++			}
++			if (((prot & PROT_READ) && !(fp->f_flag & FREAD)) ||
++			    ((prot & PROT_WRITE) && !(fp->f_flag & FWRITE))) {
++				error = EACCES;
++				goto out;
++			}
++			flags |= MAP_SHARED;
++			error = uvm_mmapobject(&p->p_vmspace->vm_map, &addr,
++			    size, prot, flags, fp, pos, lim_cur(RLIMIT_MEMLOCK));
++			FRELE(fp, p);
++			KERNEL_UNLOCK();
++			goto mapped;
++		}
+ 		if (fp->f_type != DTYPE_VNODE) {
+ 			error = ENODEV;		/* only mmap vnodes! */
+ 			goto out;
+@@ -344,6 +364,11 @@ sys_mmap(struct proc *p, void *v, regist
+ 		 * so just change it to MAP_SHARED.
+ 		 */
+ 		if (vp->v_type == VCHR && (flags & MAP_PRIVATE) != 0) {
++#if NDRM > 0
++			if ((error = drm_reject_private_mmap(vp->v_rdev, pos,
++			    size)) != 0)
++				goto out;
++#endif
+ 			flags = (flags & ~MAP_PRIVATE) | MAP_SHARED;
+ 		}
+ 
+@@ -426,6 +451,7 @@ is_anon:	/* label for SunOS style /dev/z
+ 		error = uvm_mmapanon(&p->p_vmspace->vm_map, &addr, size, prot,
+ 		    maxprot, flags, lim_cur(RLIMIT_MEMLOCK), p);
+ 	}
++mapped:
+ 
+ 	if (error == 0)
+ 		/* remember to add offset */
+@@ -1045,7 +1071,7 @@ uvm_mmapfile(vm_map_t map, vaddr_t *addr
+     vsize_t locklimit, struct proc *p)
+ {
+ 	struct uvm_object *uobj;
+-	int error;
++	int error = 0;
+ 	int advice = MADV_NORMAL;
+ 	unsigned int uvmflag = 0;
+ 	vsize_t align = 0;	/* userland page size */
+@@ -1102,22 +1128,31 @@ uvm_mmapfile(vm_map_t map, vaddr_t *addr
+ 			}
+ 		}
+ 	} else {
++		error = 0;
+ 		uobj = udv_attach(vp->v_rdev,
+ 		    (flags & MAP_SHARED) ? maxprot :
+-		    (maxprot & ~PROT_WRITE), foff, size);
++		    (maxprot & ~PROT_WRITE), prot, foff, size, &maxprot, &error);
+ 		/*
+ 		 * XXX Some devices don't like to be mapped with
+ 		 * XXX PROT_EXEC, but we don't really have a
+ 		 * XXX better way of handling this, right now
+ 		 */
+-		if (uobj == NULL && (prot & PROT_EXEC) == 0) {
++		if (uobj == NULL && error == 0 && (prot & PROT_EXEC) == 0) {
+ 			maxprot &= ~PROT_EXEC;
++			error = 0;
+ 			uobj = udv_attach(vp->v_rdev,
+ 			    (flags & MAP_SHARED) ? maxprot :
+-			    (maxprot & ~PROT_WRITE), foff, size);
++			    (maxprot & ~PROT_WRITE), prot, foff, size, &maxprot,
++			    &error);
++		}
++		if (uobj != NULL && error == -1) {
++			maxprot &= ~PROT_EXEC;
++			error = 0;
+ 		}
+ 		advice = MADV_RANDOM;
+ 	}
++	if (uobj == NULL && error != 0)
++		return error;
+ 
+ 	if (uobj == NULL)
+ 		return vp->v_type == VREG ? ENOMEM : EINVAL;
+@@ -1146,6 +1181,53 @@ uvm_mmapfile(vm_map_t map, vaddr_t *addr
+ 		uobj->pgops->pgo_detach(uobj);
+ 
+ 	return error;
++}
++
++/* Non-vnode files supply a referenced pager; mapping consumes that reference. */
++int
++uvm_mmapobject(vm_map_t map, vaddr_t *addr, vsize_t size, vm_prot_t prot,
++    int flags, struct file *fp, voff_t off, vsize_t locklimit)
++{
++	struct uvm_object *uobj = NULL;
++	vm_prot_t maxprot, file_maxprot;
++	unsigned int uvmflag = 0;
++	int error;
++
++	if ((flags & MAP_FIXED) == 0)
++		*addr = round_page(*addr);
++	else {
++		if (*addr & PAGE_MASK)
++			return EINVAL;
++		uvmflag |= UVM_FLAG_FIXED;
++		if ((flags & __MAP_NOREPLACE) == 0)
++			uvmflag |= UVM_FLAG_UNMAP;
++	}
++	if (flags & MAP_CONCEAL)
++		uvmflag |= UVM_FLAG_CONCEAL;
++	maxprot = PROT_EXEC;
++	if (fp->f_flag & FREAD)
++		maxprot |= PROT_READ;
++	if (fp->f_flag & FWRITE)
++		maxprot |= PROT_WRITE;
++	file_maxprot = maxprot;
++	error = fp->f_ops->fo_mmap(fp, off, size, prot, &maxprot, &uobj);
++	if (error)
++		return error;
++	if (uobj == NULL)
++		return EINVAL;
++	maxprot &= file_maxprot;
++	if ((prot & maxprot) != prot) {
++		uobj->pgops->pgo_detach(uobj);
++		return EACCES;
++	}
++	uvmflag = UVM_MAPFLAG(prot, maxprot, MAP_INHERIT_SHARE, MADV_RANDOM,
++	    uvmflag);
++	error = uvm_map(map, addr, size, uobj, off, 0, uvmflag);
++	if (error) {
++		uobj->pgops->pgo_detach(uobj);
++		return error;
++	}
++	return uvm_mmaplock(map, addr, size, prot, locklimit);
+ }
+ 
+ int
+Index: sys/uvm/uvm_object.c
+===================================================================
+RCS file: /cvs/src/sys/uvm/uvm_object.c,v
+diff -u -p -r1.29 uvm_object.c
+--- sys/uvm/uvm_object.c	22 Jul 2026 20:58:23 -0000	1.29
++++ sys/uvm/uvm_object.c	20 Nov 2026 16:50:43 -0000
+@@ -79,6 +79,27 @@ uvm_obj_init(struct uvm_object *uobj, co
+ 	uobj->uo_refs = refs;
+ }
+ 
++/* As above, but do not wait for a dynamically allocated object lock. */
++int
++uvm_obj_init_try(struct uvm_object *uobj, const struct uvm_pagerops *pgops,
++    int refs)
++{
++	int alock;
++
++	alock = ((pgops != NULL) && (pgops != &pmap_pager) &&
++	    (pgops != &bufcache_pager) && (refs != UVM_OBJ_KERN));
++	if (alock) {
++		if (!rw_obj_tryalloc(&uobj->vmobjlock, "uobjlk"))
++			return 0;
++	} else
++		uobj->vmobjlock = NULL;
++	uobj->pgops = pgops;
++	RBT_INIT(uvm_objtree, &uobj->memt);
++	uobj->uo_npages = 0;
++	uobj->uo_refs = refs;
++	return 1;
++}
++
+ /*
+  * uvm_obj_destroy: destroy UVM memory object.
+  */
+Index: sys/uvm/uvm_object.h
+===================================================================
+RCS file: /cvs/src/sys/uvm/uvm_object.h,v
+diff -u -p -r1.30 uvm_object.h
+--- sys/uvm/uvm_object.h	4 Sep 2022 06:49:11 -0000	1.30
++++ sys/uvm/uvm_object.h	20 Nov 2026 16:50:43 -0000
+@@ -115,6 +115,7 @@ RBT_PROTOTYPE(uvm_objtree, vm_page, objt
+ 	(UVM_OBJ_IS_PMAP(uobj) || UVM_OBJ_IS_BUFCACHE(uobj))
+ 
+ void	uvm_obj_init(struct uvm_object *, const struct uvm_pagerops *, int);
++int	uvm_obj_init_try(struct uvm_object *, const struct uvm_pagerops *, int);
+ void	uvm_obj_destroy(struct uvm_object *);
+ void	uvm_obj_setlock(struct uvm_object *, struct rwlock *);
+ int	uvm_obj_wire(struct uvm_object *, voff_t, voff_t, struct pglist *);

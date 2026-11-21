@@ -1,0 +1,90 @@
+Index: sys/kern/kern_pledge.c
+===================================================================
+RCS file: /cvs/src/sys/kern/kern_pledge.c,v
+diff -u -p -r1.369 kern_pledge.c
+--- sys/kern/kern_pledge.c	21 Sep 2026 00:46:13 -0000	1.369
++++ sys/kern/kern_pledge.c	20 Nov 2026 16:11:55 -0000
+@@ -36,6 +36,7 @@
+ #include <sys/domain.h>
+ 
+ #include <sys/ioctl.h>
++#include <sys/dmabufio.h>
+ #include <sys/termios.h>
+ #include <sys/tty.h>
+ #include <sys/device.h>
+@@ -1141,6 +1142,14 @@ pledge_ioctl(struct proc *p, long com, s
+ 	}
+ 
+ #if NDRM > 0
++	if ((pledge & PLEDGE_DRM) && fp->f_type == DTYPE_DMABUF) {
++		switch (com) {
++		case DMA_BUF_IOCTL_SYNC:
++		case DMA_BUF_IOCTL_EXPORT_SYNC_FILE:
++		case DMA_BUF_IOCTL_IMPORT_SYNC_FILE:
++			return (0);
++		}
++	}
+ 	if ((pledge & PLEDGE_DRM)) {
+ 		if ((fp->f_type == DTYPE_VNODE) &&
+ 		    (vp->v_type == VCHR) &&
+Index: sys/uvm/uvm_device.c
+===================================================================
+RCS file: /cvs/src/sys/uvm/uvm_device.c,v
+diff -u -p -r1.68 uvm_device.c
+--- sys/uvm/uvm_device.c	15 Dec 2024 11:02:59 -0000	1.68
++++ sys/uvm/uvm_device.c	20 Nov 2026 16:11:56 -0000
+@@ -91,3 +91,4 @@
+ struct uvm_object *
+-udv_attach(dev_t device, vm_prot_t accessprot, voff_t off, vsize_t size)
++udv_attach(dev_t device, vm_prot_t accessprot, vm_prot_t prot, voff_t off,
++    vsize_t size, vm_prot_t *maxprot, int *error)
+ {
+@@ -116,5 +117,5 @@
+ #if NDRM > 0
+-	obj = udv_attach_drm(device, accessprot, off, size);
+-	if (obj)
+-		return(obj);
++	obj = udv_attach_drm(device, accessprot, prot, off, size, maxprot, error);
++	if (obj || *error)
++		return obj;
+ #endif
+Index: sys/sys/dmabufio.h
+===================================================================
+--- /dev/null	Sat Nov 21 01:50:46 2026
++++ sys/sys/dmabufio.h	Wed Nov 11 15:14:05 2026
+@@ -0,0 +1,35 @@
++/*
++ * Copyright (c) 2018 Mark Kettenis
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++#ifndef _SYS_DMABUFIO_H_
++#define _SYS_DMABUFIO_H_
++
++#include <sys/types.h>
++#include <sys/ioccom.h>
++
++#define DMA_BUF_SYNC_READ  (1U << 0)
++#define DMA_BUF_SYNC_WRITE (1U << 1)
++#define DMA_BUF_SYNC_RW    (DMA_BUF_SYNC_READ | DMA_BUF_SYNC_WRITE)
++#define DMA_BUF_SYNC_START 0ULL
++#define DMA_BUF_SYNC_END   (1ULL << 2)
++#define DMA_BUF_SYNC_VALID_FLAGS_MASK (DMA_BUF_SYNC_RW | DMA_BUF_SYNC_END)
++struct dma_buf_sync { uint64_t flags; };
++#define DMA_BUF_IOCTL_SYNC _IOW('b', 0, struct dma_buf_sync)
++struct dma_buf_export_sync_file { uint32_t flags; int32_t fd; };
++struct dma_buf_import_sync_file { uint32_t flags; int32_t fd; };
++#define DMA_BUF_IOCTL_EXPORT_SYNC_FILE _IOWR('b', 2, struct dma_buf_export_sync_file)
++#define DMA_BUF_IOCTL_IMPORT_SYNC_FILE _IOW('b', 3, struct dma_buf_import_sync_file)
++
++#endif /* _SYS_DMABUFIO_H_ */

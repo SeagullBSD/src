@@ -1,0 +1,33 @@
+Index: sys/dev/pci/drm/amd/amdgpu/amdgpu_drv.c
+===================================================================
+RCS file: /cvs/src/sys/dev/pci/drm/amd/amdgpu/amdgpu_drv.c,v
+diff -u -p -r1.78 amdgpu_drv.c
+--- sys/dev/pci/drm/amd/amdgpu/amdgpu_drv.c	22 Sep 2026 03:48:35 -0000	1.78
++++ sys/dev/pci/drm/amd/amdgpu/amdgpu_drv.c	20 Nov 2026 17:50:37 -0000
+@@ -3397,8 +3397,6 @@ amdgpu_probe(struct device *parent, void
+  */
+ int amdgpu_refcnt;
+ 
+-int __init drm_sched_fence_slab_init(void);
+-void __exit drm_sched_fence_slab_fini(void);
+ irqreturn_t amdgpu_irq_handler(void *);
+ 
+ void
+@@ -3555,8 +3553,6 @@ amdgpu_attach(struct device *parent, str
+ 
+ 	/* from amdgpu_init() */
+ 	if (amdgpu_refcnt == 0) {
+-		drm_sched_fence_slab_init();
+-
+ 		if (amdgpu_sync_init()) {
+ 			printf("%s: amdgpu_sync_init failed\n",
+ 			    adev->self.dv_xname);
+@@ -4019,8 +4015,6 @@ amdgpu_detach(struct device *self, int f
+ 		amdgpu_sync_fini();
+ 		amdgpu_userq_fence_slab_fini();
+ 		amdgpu_xcp_drv_release();
+-
+-		drm_sched_fence_slab_fini();
+ 	}
+ 
+ 	config_detach(adev->ddev.dev, flags);

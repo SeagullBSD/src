@@ -1,0 +1,95 @@
+Index: sys/arch/arm64/dev/simplebus.c
+===================================================================
+RCS file: /cvs/src/sys/arch/arm64/dev/simplebus.c,v
+diff -u -p -r1.25 simplebus.c
+--- sys/arch/arm64/dev/simplebus.c	19 Aug 2026 20:14:06 -0000	1.25
++++ sys/arch/arm64/dev/simplebus.c	20 Nov 2026 16:10:19 -0000
+@@ -40,6 +40,32 @@ int simplebus_dmamap_load_buffer(bus_dma
+ int simplebus_dmamap_load_raw(bus_dma_tag_t, bus_dmamap_t,
+     bus_dma_segment_t *, int, bus_size_t, int);
+ 
++/* This wrapper changes DMA addresses only; its standard parent supplies
++ * physical addresses, CPU addresses and _dm_nused accounting. */
++static int
++simplebus_dmamap_nobounce_safe(bus_dma_tag_t t)
++{
++	struct simplebus_softc *sc;
++	bus_dma_tag_t parent;
++
++	if (t == NULL || t->_dmamap_load_raw != simplebus_dmamap_load_raw ||
++	    t->_dmamap_load != _dmamap_load ||
++	    t->_dmamap_load_buffer != simplebus_dmamap_load_buffer ||
++	    t->_dmamap_create != _dmamap_create ||
++	    t->_dmamap_destroy != _dmamap_destroy ||
++	    t->_dmamap_unload != _dmamap_unload ||
++	    t->_dmamap_sync != _dmamap_sync || t->_cookie == NULL)
++		return 0;
++	sc = t->_cookie;
++	parent = sc->sc_dmat;
++	return parent != NULL && parent->_dmamap_create == _dmamap_create &&
++	    parent->_dmamap_destroy == _dmamap_destroy &&
++	    parent->_dmamap_load == _dmamap_load &&
++	    parent->_dmamap_load_buffer == _dmamap_load_buffer &&
++	    parent->_dmamap_load_raw == _dmamap_load_raw &&
++	    parent->_dmamap_unload == _dmamap_unload;
++}
++
+ const struct cfattach simplebus_ca = {
+ 	sizeof(struct simplebus_softc), simplebus_match, simplebus_attach
+ };
+@@ -110,2 +110,3 @@
+ 	sc->sc_dma._dmamap_load_raw = simplebus_dmamap_load_raw;
++	sc->sc_dma._dmamap_nobounce_safe = simplebus_dmamap_nobounce_safe;
+ 	sc->sc_dma._cookie = sc;
+Index: sys/arch/arm64/dev/apldart.c
+===================================================================
+RCS file: /cvs/src/sys/arch/arm64/dev/apldart.c,v
+diff -u -p -r1.23 apldart.c
+--- sys/arch/arm64/dev/apldart.c	5 Sep 2026 20:36:56 -0000	1.23
++++ sys/arch/arm64/dev/apldart.c	20 Nov 2026 16:10:19 -0000
+@@ -243,4 +243,33 @@
+ void	apldart_dmamap_unload(bus_dma_tag_t, bus_dmamap_t);
+ 
++/* DART raw maps delegate to the parent before replacing DMA addresses with
++ * IOVAs. The parent must prove that _dm_nused reflects every bounce. */
++static int
++apldart_dmamap_nobounce_safe(bus_dma_tag_t t)
++{
++	struct apldart_stream *as;
++	bus_dma_tag_t parent;
++
++	if (t == NULL || t->_dmamap_create != apldart_dmamap_create ||
++	    t->_dmamap_destroy != apldart_dmamap_destroy ||
++	    t->_dmamap_load != apldart_dmamap_load ||
++	    t->_dmamap_load_raw != apldart_dmamap_load_raw ||
++	    t->_dmamap_unload != apldart_dmamap_unload ||
++	    t->_dmamap_sync != _dmamap_sync ||
++	    !(t->_flags & BUS_DMA_COHERENT) || t->_cookie == NULL)
++		return 0;
++	as = t->_cookie;
++	if (as->as_sc == NULL || (parent = as->as_sc->sc_dmat) == NULL)
++		return 0;
++	return parent->_dmamap_create == _dmamap_create &&
++	    parent->_dmamap_destroy == _dmamap_destroy &&
++	    parent->_dmamap_load == _dmamap_load &&
++	    parent->_dmamap_unload == _dmamap_unload &&
++	    ((parent->_dmamap_load_raw == _dmamap_load_raw &&
++	    parent->_dmamap_load_buffer == _dmamap_load_buffer) ||
++	    (parent->_dmamap_nobounce_safe != NULL &&
++	    parent->_dmamap_nobounce_safe(parent)));
++}
++
+ int
+ apldart_match(struct device *parent, void *match, void *aux)
+@@ -593,2 +622,3 @@
+ 	as->as_dmat._dmamap_unload = apldart_dmamap_unload;
++	as->as_dmat._dmamap_nobounce_safe = apldart_dmamap_nobounce_safe;
+ 	as->as_dmat._flags |= BUS_DMA_COHERENT;
+@@ -677,2 +707,3 @@
+ 	as->as_dmat._dmamap_unload = apldart_dmamap_unload;
++	as->as_dmat._dmamap_nobounce_safe = apldart_dmamap_nobounce_safe;
+ 	as->as_dmat._flags |= BUS_DMA_COHERENT;
+@@ -734,2 +765,3 @@
+ 	as->as_dmat._dmamap_unload = apldart_dmamap_unload;
++	as->as_dmat._dmamap_nobounce_safe = apldart_dmamap_nobounce_safe;
+ 	as->as_dmat._flags |= BUS_DMA_COHERENT;

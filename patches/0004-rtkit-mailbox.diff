@@ -1,0 +1,134 @@
+Index: sys/dev/ofw/ofw_misc.c
+===================================================================
+RCS file: /cvs/src/sys/dev/ofw/ofw_misc.c,v
+diff -u -p -r1.45 ofw_misc.c
+--- sys/dev/ofw/ofw_misc.c	5 Sep 2026 20:36:56 -0000	1.45
++++ sys/dev/ofw/ofw_misc.c	20 Nov 2026 17:45:58 -0000
+@@ -1254,6 +1254,8 @@ iommu_reserve_region_pci(int node, uint3
+ struct mbox_channel {
+ 	struct mbox_device	*mc_md;
+ 	void			*mc_cookie;
++	void			(*mc_rx_callback)(void *);
++	void			*mc_rx_arg;
+ };
+ 
+ LIST_HEAD(, mbox_device) mbox_devices =
+@@ -1282,6 +1284,10 @@ mbox_channel_cells(uint32_t *cells, stru
+ 		if (md->md_phandle == phandle)
+ 			break;
+ 	}
++	if (client != NULL && (client->mc_flags & MC_PAUSED) &&
++	    (md == NULL || !(md->md_flags & MBOX_DEVICE_PAUSED_CLAIM) ||
++	    md->md_pause == NULL || md->md_resume == NULL))
++		return NULL;
+ 
+ 	if (md && md->md_channel) {
+ 		cookie = md->md_channel(md->md_cookie, &cells[1], client);
+@@ -1289,6 +1295,8 @@ mbox_channel_cells(uint32_t *cells, stru
+ 			mc = malloc(sizeof(*mc), M_DEVBUF, M_WAITOK);
+ 			mc->mc_md = md;
+ 			mc->mc_cookie = cookie;
++			mc->mc_rx_callback = client ? client->mc_rx_callback : NULL;
++			mc->mc_rx_arg = client ? client->mc_rx_arg : NULL;
+ 			return mc;
+ 		}
+ 	}
+@@ -1371,6 +1379,50 @@ mbox_recv(struct mbox_channel *mc, void 
+ 		return md->md_recv(mc->mc_cookie, data, len);
+ 
+ 	return ENXIO;
++}
++
++int
++mbox_pause(struct mbox_channel *mc, int flags)
++{
++	if (mc == NULL || (flags & ~MBOX_PAUSE_NOSLEEP))
++		return EINVAL;
++	if (mc->mc_md->md_pause == NULL || mc->mc_md->md_resume == NULL)
++		return EOPNOTSUPP;
++	return mc->mc_md->md_pause(mc->mc_cookie, flags);
++}
++
++int
++mbox_resume(struct mbox_channel *mc)
++{
++	if (mc == NULL)
++		return EINVAL;
++	if (mc->mc_md->md_pause == NULL || mc->mc_md->md_resume == NULL)
++		return EOPNOTSUPP;
++	return mc->mc_md->md_resume(mc->mc_cookie);
++}
++
++int
++mbox_detach(struct mbox_channel *mc)
++{
++	int error;
++
++	if (mc == NULL)
++		return EINVAL;
++	if (mc->mc_md->md_detach == NULL)
++		return EOPNOTSUPP;
++	error = mc->mc_md->md_detach(mc->mc_cookie, mc->mc_rx_callback,
++	    mc->mc_rx_arg);
++	if (error)
++		return error;
++	mc->mc_rx_callback = NULL;
++	mc->mc_rx_arg = NULL;
++	return 0;
++}
++
++void
++mbox_free(struct mbox_channel *mc)
++{
++	free(mc, M_DEVBUF, sizeof(*mc));
+ }
+ 
+ /* hwlock support */
+Index: sys/dev/ofw/ofw_misc.h
+===================================================================
+RCS file: /cvs/src/sys/dev/ofw/ofw_misc.h,v
+diff -u -p -r1.32 ofw_misc.h
+--- sys/dev/ofw/ofw_misc.h	5 Sep 2026 20:36:56 -0000	1.32
++++ sys/dev/ofw/ofw_misc.h	20 Nov 2026 17:45:58 -0000
+@@ -293,16 +293,22 @@ struct mbox_client {
+ 	void	*mc_rx_arg;
+ 	int	mc_flags;
+ #define MC_WAKEUP		0x00000001
++#define MC_PAUSED		0x00000002	/* claim with RX paused */
+ };
+ 
+ struct mbox_channel;
+ 
+ struct mbox_device {
+ 	int	md_node;
++	int	md_flags;
++#define MBOX_DEVICE_PAUSED_CLAIM	0x01
+ 	void	*md_cookie;
+ 	void	*(*md_channel)(void *, uint32_t *, struct mbox_client *);
+ 	int	(*md_recv)(void *, void *, size_t);
+ 	int	(*md_send)(void *, const void *, size_t);
++	int	(*md_detach)(void *, void (*)(void *), void *);
++	int	(*md_pause)(void *, int);
++	int	(*md_resume)(void *);
+ 
+ 	LIST_ENTRY(mbox_device) md_list;
+ 	uint32_t md_phandle;
+@@ -316,6 +322,18 @@ struct mbox_channel *mbox_channel_idx(in
+ 
+ int	mbox_send(struct mbox_channel *, const void *, size_t);
+ int	mbox_recv(struct mbox_channel *, void *, size_t);
++/*
++ * Pause blocks receive callbacks and retains pending FIFO data.  Explicit
++ * receive remains available.  NOSLEEP returns EBUSY rather than waiting.
++ * Resume re-enables delivery, including messages already pending.
++ */
++#define MBOX_PAUSE_NOSLEEP	0x01
++int	mbox_pause(struct mbox_channel *, int);
++int	mbox_resume(struct mbox_channel *);
++/* Caller serializes channel users; detach waits for receive callbacks. */
++int	mbox_detach(struct mbox_channel *);
++/* Release only after detach and after all send/receive users have stopped. */
++void	mbox_free(struct mbox_channel *);
+ 
+ /* hwlock support */
+ 

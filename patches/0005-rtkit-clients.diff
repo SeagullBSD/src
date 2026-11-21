@@ -1,0 +1,119 @@
+Index: sys/arch/arm64/dev/aplsmc.c
+===================================================================
+RCS file: /cvs/src/sys/arch/arm64/dev/aplsmc.c,v
+diff -u -p -r1.33 aplsmc.c
+--- sys/arch/arm64/dev/aplsmc.c	26 Jul 2026 10:25:31 -0000	1.33
++++ sys/arch/arm64/dev/aplsmc.c	20 Nov 2026 16:10:19 -0000
+@@ -117,2 +117,4 @@ struct aplsmc_softc {
+ 	bus_space_handle_t	sc_ioh;
+ 	bus_space_handle_t	sc_sram_ioh;
++	bus_addr_t		sc_sram_base;
++	bus_size_t		sc_sram_size;
+@@ -195,2 +197,2 @@
+-paddr_t	aplsmc_logmap(void *, bus_addr_t);
++paddr_t	aplsmc_logmap(void *, bus_addr_t, bus_size_t);
+ void	aplsmc_callback(void *, uint64_t);
+@@ -233,6 +235,8 @@ aplsmc_attach(struct device *parent, struct device *self, void *aux)
+-	if (faa->fa_nreg < 1) {
+-		printf(": no registers\n");
++	if (faa->fa_nreg < 2 || faa->fa_reg[1].size < SMC_SRAM_SIZE) {
++		printf(": no SRAM registers\n");
+ 		return;
+ 	}
+ 
+ 	sc->sc_iot = faa->fa_iot;
++	sc->sc_sram_base = faa->fa_reg[1].addr;
++	sc->sc_sram_size = faa->fa_reg[1].size;
+@@ -255,1 +259,3 @@
+ 	sc->sc_rk.rk_logmap = aplsmc_logmap;
++	/* SRAM containment is arithmetic only and does not sleep. */
++	sc->sc_rk.rk_logmap_nosleep = 1;
+@@ -393,5 +399,13 @@
+ paddr_t
+-aplsmc_logmap(void *cookie, bus_addr_t addr)
++aplsmc_logmap(void *cookie, bus_addr_t addr, bus_size_t size)
+ {
++	struct aplsmc_softc *sc = cookie;
++	bus_addr_t offset;
++
++	if (size == 0 || addr < sc->sc_sram_base)
++		return (paddr_t)-1;
++	offset = addr - sc->sc_sram_base;
++	if (offset > sc->sc_sram_size || size > sc->sc_sram_size - offset)
++		return (paddr_t)-1;
+ 	return addr | PMAP_DEVICE;
+ }
+Index: sys/dev/pci/drm/apple/apldcp.c
+===================================================================
+RCS file: /cvs/src/sys/dev/pci/drm/apple/apldcp.c,v
+diff -u -p -r1.4 apldcp.c
+--- sys/dev/pci/drm/apple/apldcp.c	14 Feb 2025 18:42:43 -0000	1.4
++++ sys/dev/pci/drm/apple/apldcp.c	20 Nov 2026 16:11:53 -0000
+@@ -126,7 +126,7 @@ struct apple_rtkit {
+ };
+ 
+ paddr_t
+-apple_rtkit_logmap(void *cookie, bus_addr_t addr)
++apple_rtkit_logmap(void *cookie, bus_addr_t addr, bus_size_t map_size)
+ {
+ 	struct apple_rtkit *rtk = cookie;
+ 	int idx, len, node;
+@@ -134,16 +134,24 @@ apple_rtkit_logmap(void *cookie, bus_addr_t addr)
+ 	uint32_t iommu_addrs[5];
+ 	bus_addr_t trunc_addr;
+ 	bus_addr_t start;
+-	bus_size_t size;
++	bus_size_t size, offset;
+ 	uint64_t reg[2];
+ 
++	if (map_size == 0 || addr > (bus_addr_t)-1 - (map_size - 1))
++		return (paddr_t)-1;
++
+ 	/* XXX some machines have truncated DVAs in "iommu-addresses" */
+ 	trunc_addr = addr & 0xffffffff;
+ 
+ 	len = OF_getproplen(rtk->pdev->node, "memory-region");
++	if (len <= 0 || len % sizeof(*phandles) != 0)
++		return (paddr_t)-1;
+ 	phandles = malloc(len, M_TEMP, M_WAITOK | M_ZERO);
+-	OF_getpropintarray(rtk->pdev->node, "memory-region",
+-	    phandles, len);
++	if (OF_getpropintarray(rtk->pdev->node, "memory-region",
++	    phandles, len) != len) {
++		free(phandles, M_TEMP, len);
++		return (paddr_t)-1;
++	}
+ 
+ 	for (idx = 0; idx < len / sizeof(uint32_t); idx++) {
+ 		node = OF_getnodebyphandle(phandles[idx]);
+@@ -163,19 +171,24 @@ apple_rtkit_logmap(void *cookie, bus_addr_t addr)
+ 		start = (uint64_t)iommu_addrs[1] << 32 | iommu_addrs[2];
+ 		size = (uint64_t)iommu_addrs[3] << 32 | iommu_addrs[4];
+ 
+-		if (addr >= start && addr < start + size) {
+-			free(phandles, M_TEMP, len);
+-			return (reg[0] + (addr - start)) | PMAP_NOCACHE;
+-		}
+-
+-		if (trunc_addr >= start && trunc_addr < start + size) {
++		if (addr >= start && addr - start < size)
++			offset = addr - start;
++		else if (trunc_addr >= start && trunc_addr - start < size)
++			offset = trunc_addr - start;
++		else
++			continue;
++		if (map_size > size - offset || offset > reg[1] ||
++		    map_size > reg[1] - offset || reg[0] > (uint64_t)-1 - offset ||
++		    map_size - 1 > (uint64_t)-1 - (reg[0] + offset)) {
+ 			free(phandles, M_TEMP, len);
+-			return (reg[0] + (trunc_addr - start)) | PMAP_NOCACHE;
++			return (paddr_t)-1;
+ 		}
++		free(phandles, M_TEMP, len);
++		return (reg[0] + offset) | PMAP_NOCACHE;
+ 	}
+ 
+ 	free(phandles, M_TEMP, len);
+-	return addr | PMAP_NOCACHE;
++	return (paddr_t)-1;
+ }
